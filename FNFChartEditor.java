@@ -14,7 +14,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import javax.imageio.ImageIO;
 import javax.sound.sampled.*;
 
@@ -172,9 +174,9 @@ public class FNFChartEditor extends JFrame {
             size = 0;
         }
 
-        private static int pack(double timeMs, double sustainMs, int laneValue, double stepTimeMs) {
+        private static int pack(double localTimeMs, double sustainMs, int laneValue, double stepTimeMs) {
             double safeStep = Math.max(1.0e-9, stepTimeMs);
-            int timeUnits = (int) Math.round((Math.max(0.0, timeMs) / safeStep) * 4096.0);
+            int timeUnits = (int) Math.round((Math.max(0.0, localTimeMs) / safeStep) * 4096.0);
             int sustainUnits = (int) Math.round((Math.max(0.0, sustainMs) / safeStep) * 32.0);
             timeUnits = Math.max(0, Math.min(MAX_TIME_UNITS, timeUnits));
             sustainUnits = Math.max(0, Math.min(MAX_SUSTAIN_UNITS, sustainUnits));
@@ -191,7 +193,7 @@ public class FNFChartEditor extends JFrame {
             row = Math.max(0, Math.min(ROW_BUCKETS - 1, row));
             Bucket target = bucket(row, true);
             long globalIndex = globalOffsetForRow(row) + target.size();
-            target.add(pack(timeMs, sustainMs, laneValue, stepTimeMs));
+            target.add(pack(Math.max(0.0, timeMs - row * stepTimeMs), sustainMs, laneValue, stepTimeMs));
             size++;
             return globalIndex;
         }
@@ -199,7 +201,7 @@ public class FNFChartEditor extends JFrame {
         public void addFast(double timeMs, int laneValue, double sustainMs, double rowHint, double stepTimeMs) {
             int row = (int) Math.floor(rowHint);
             row = Math.max(0, Math.min(ROW_BUCKETS - 1, row));
-            bucket(row, true).add(pack(timeMs, sustainMs, laneValue, stepTimeMs));
+            bucket(row, true).add(pack(Math.max(0.0, timeMs - row * stepTimeMs), sustainMs, laneValue, stepTimeMs));
             size++;
         }
 
@@ -227,7 +229,7 @@ public class FNFChartEditor extends JFrame {
         public double getTime(long index, double stepTimeMs) {
             long[] loc = locate(index);
             if (loc == null) return 0.0;
-            return (timeUnits(buckets[(int) loc[0]].getRecord(loc[1])) / 4096.0) * stepTimeMs;
+            return loc[0] * stepTimeMs + (timeUnits(buckets[(int) loc[0]].getRecord(loc[1])) / 4096.0) * stepTimeMs;
         }
 
         public int getLane(long index) {
@@ -285,7 +287,7 @@ public class FNFChartEditor extends JFrame {
                 for (long i = 0; i < b.size(); i++) {
                     int record = b.getRecord(i);
                     if (lane(record) != targetLane) continue;
-                    double noteTime = (timeUnits(record) / 4096.0) * safeStep;
+                    double noteTime = row * safeStep + (timeUnits(record) / 4096.0) * safeStep;
                     if (Math.abs(noteTime - timeMs) <= toleranceMs) {
                         return base + i;
                     }
@@ -337,7 +339,7 @@ public class FNFChartEditor extends JFrame {
                 long i = 0;
                 while (i < b.size()) {
                     int record = b.getRecord(i);
-                    double time = (timeUnits(record) / 4096.0) * stepTimeMs;
+                    double time = row * stepTimeMs + (timeUnits(record) / 4096.0) * stepTimeMs;
                     int noteLane = lane(record);
                     if (noteLane >= minLane && noteLane <= maxLane
                             && time >= minRelativeTimeMs && time < maxRelativeTimeMs) {
@@ -363,7 +365,7 @@ public class FNFChartEditor extends JFrame {
 
         public double rowGetTime(int row, long index, double stepTimeMs) {
             Bucket b = bucket(row, false);
-            return b == null ? 0.0 : (timeUnits(b.getRecord(index)) / 4096.0) * stepTimeMs;
+            return b == null ? 0.0 : row * stepTimeMs + (timeUnits(b.getRecord(index)) / 4096.0) * stepTimeMs;
         }
 
         public int rowGetLane(int row, long index) {
@@ -1131,7 +1133,7 @@ public class FNFChartEditor extends JFrame {
 
         JButton loadBtn = new JButton("Load Chart (JSON / BIN)");
         loadBtn.addActionListener(e -> {
-            JFileChooser chooser = new JFileChooser(".");
+            JFileChooser chooser = new JFileChooser(initialImportDirectory());
             chooser.setDialogTitle("Load FNF Chart (JSON or BIN)");
             int choice = chooser.showOpenDialog(this);
             if (choice == JFileChooser.APPROVE_OPTION) {
@@ -1866,120 +1868,23 @@ public class FNFChartEditor extends JFrame {
         private static final long serialVersionUID = 1L;
     }
 
+    private String initialImportDirectory() {
+        File importDir = new File("charts-to-import");
+        if (importDir.isDirectory()) return importDir.getAbsolutePath();
+        File parent = new File("..", "charts-to-import");
+        if (parent.isDirectory()) return parent.getAbsolutePath();
+        return ".";
+    }
+
     private void loadChart(File file) {
         if (!file.exists()) return;
         if (file.getName().toLowerCase().endsWith(".bin")) {
             loadBinaryChart(file);
             return;
         }
-        try (BufferedReader br = new BufferedReader(new FileReader(file))) {
-            StringBuilder content = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) {
-                content.append(line).append('\n');
-            }
-
-            String json = content.toString();
-            SongData loadedSong = new SongData();
-
-            // Supports the three common JSON layouts used by the supplied charts:
-            // 1) JS Engine / Psych-style { "song": { ... } }
-            // 2) Psych Engine 1.0 { "speed": ..., "notes": [...] }
-            // 3) This editor's JSON { "song": ..., "bpm": ..., "notes": [...] }
-            int songObjectOffset = json.indexOf("\"song\"", json.indexOf("{"));
-            if (songObjectOffset < 0) songObjectOffset = 0;
-
-            loadedSong.song = extractJSONString(json, "song", songObjectOffset);
-            loadedSong.bpm = extractJSONDouble(json, "bpm", songObjectOffset);
-            if (loadedSong.bpm <= 0) loadedSong.bpm = 120.0;
-            loadedSong.needsVoices = extractJSONBool(json, "needsVoices", songObjectOffset);
-            loadedSong.player1 = extractJSONString(json, "player1", songObjectOffset);
-            loadedSong.player2 = extractJSONString(json, "player2", songObjectOffset);
-            loadedSong.speed = extractJSONDouble(json, "speed", songObjectOffset);
-            if (loadedSong.speed <= 0) loadedSong.speed = 1.0;
-
-            List<Section> sections = new ArrayList<>();
-            int notesStartIndex = json.indexOf("\"notes\"");
-            if (notesStartIndex != -1) {
-                int notesArrayStart = json.indexOf('[', notesStartIndex);
-                int notesArrayEnd = notesArrayStart >= 0 ? findMatchingJsonBracket(json, notesArrayStart, '[', ']') : -1;
-
-                if (notesArrayStart >= 0 && notesArrayEnd > notesArrayStart) {
-                    String notesArray = json.substring(notesArrayStart + 1, notesArrayEnd);
-                    java.util.regex.Pattern objectPattern = java.util.regex.Pattern.compile("\\{([^{}]*)\\}", java.util.regex.Pattern.DOTALL);
-                    java.util.regex.Matcher objectMatcher = objectPattern.matcher(notesArray);
-
-                    double accumulatedSectionTimeMs = 0.0;
-                    while (objectMatcher.find()) {
-                        String secBlock = objectMatcher.group(1);
-                        Section section = new Section();
-
-                        // Java Chart Editor uses lengthInSteps. JS Engine / Psych often use sectionBeats.
-                        String stepStr = extractJSONString(secBlock, "lengthInSteps", 0);
-                        if (stepStr == null || stepStr.isEmpty()) {
-                            String beatsStr = extractJSONString(secBlock, "sectionBeats", 0);
-                            if (beatsStr != null && !beatsStr.isEmpty()) {
-                                try {
-                                    section.lengthInSteps = Math.max(1,
-                                            (int) Math.round(Double.parseDouble(beatsStr.replaceAll("[^0-9.+-]", "")) * 4.0));
-                                } catch (Exception ignored) {
-                                    section.lengthInSteps = 16;
-                                }
-                            } else {
-                                section.lengthInSteps = 16;
-                            }
-                        } else {
-                            try {
-                                section.lengthInSteps = Math.max(1,
-                                        (int) Math.round(Double.parseDouble(stepStr.replaceAll("[^0-9.+-]", ""))));
-                            } catch (Exception ignored) {
-                                section.lengthInSteps = 16;
-                            }
-                        }
-
-                        String mustHitStr = extractJSONString(secBlock, "mustHitSection", 0);
-                        section.mustHitSection = "true".equalsIgnoreCase(mustHitStr.trim());
-
-                        int notesArrIdx = secBlock.indexOf("\"sectionNotes\"");
-                        if (notesArrIdx != -1) {
-                            int arrStart = secBlock.indexOf('[', notesArrIdx);
-                            int arrEnd = arrStart >= 0 ? findMatchingJsonBracket(secBlock, arrStart, '[', ']') : -1;
-                            if (arrStart >= 0 && arrEnd > arrStart) {
-                                String notesBlock = secBlock.substring(arrStart, arrEnd + 1);
-                                java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
-                                        "\\[\\s*([0-9.+-E]+)\\s*,\\s*([0-9.+-E]+)\\s*,\\s*([0-9.+-E]+)(?:\\s*,.*?)?\\]"
-                                );
-                                java.util.regex.Matcher matcher = pattern.matcher(notesBlock);
-                                double sectionStartTime = accumulatedSectionTimeMs;
-                                double stepTimeMs = (60000.0 / loadedSong.bpm) / 4.0;
-                                while (matcher.find()) {
-                                    try {
-                                        double strumTime = Double.parseDouble(matcher.group(1));
-                                        int noteData = (int) Math.round(Double.parseDouble(matcher.group(2)));
-                                        double sustain = Double.parseDouble(matcher.group(3));
-                                        double relative = Math.max(0.0, strumTime - sectionStartTime);
-                                        section.sectionNotes.addFast(relative, noteData,
-                                                Math.max(0.0, sustain), relative / stepTimeMs, stepTimeMs);
-                                    } catch (Exception ignored) {
-                                        // Ignore malformed individual notes instead of failing the whole chart.
-                                    }
-                                }
-                            }
-                        }
-
-                        sections.add(section);
-                        double quarterMs = 60000.0 / loadedSong.bpm;
-                        accumulatedSectionTimeMs += (section.lengthInSteps / 4.0) * quarterMs;
-                    }
-                }
-            }
-
-            if (!sections.isEmpty()) {
-                loadedSong.notes = sections;
-            } else {
-                loadedSong.notes.add(new Section());
-            }
-
+        try {
+            String json = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+            SongData loadedSong = parseChartJSON(json);
             this.activeSong = loadedSong;
             this.currentSectionIndex = 0;
             this.positionSteps = 0;
@@ -1987,34 +1892,330 @@ public class FNFChartEditor extends JFrame {
             this.gridPanel.setScrollRowOffset(0);
             syncSongDataToUI();
             gridPanel.repaint();
-
         } catch (Exception e) {
             JOptionPane.showMessageDialog(this, "Error parsing JSON chart: " + e.getMessage());
         }
     }
 
-    private static int findMatchingJsonBracket(String text, int start, char open, char close) {
-        int depth = 0;
-        boolean inString = false;
-        boolean escaped = false;
-        for (int i = start; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (inString) {
-                if (escaped) escaped = false;
-                else if (c == '\\') escaped = true;
-                else if (c == '"') inString = false;
-                continue;
-            }
-            if (c == '"') {
-                inString = true;
-            } else if (c == open) {
-                depth++;
-            } else if (c == close) {
-                depth--;
-                if (depth == 0) return i;
+    /**
+     * Parses a chart JSON file into SongData. Supports the common FNF chart
+     * layouts without a JSON library:
+     * 1) JS Engine / Psych-style and this editor's format: { "song": { ... } }
+     * 2) Psych Engine 1.0 / flat charts: { "speed": ..., "notes": [...] }
+     * Fields are read from the nested "song" object first, then the root.
+     */
+    public static SongData parseChartJSON(String json) throws IOException {
+        JsonValue root = new JsonReader(json).read();
+        JsonObject global = root instanceof JsonObject ? (JsonObject) root : new JsonObject();
+        JsonObject container = global;
+        JsonValue songObj = global.map.get("song");
+        if (songObj instanceof JsonObject) container = (JsonObject) songObj;
+
+        SongData song = new SongData();
+
+        String s = firstString(container, global, "song");
+        if (s != null && !s.isEmpty()) song.song = s;
+        Double d = firstDouble(container, global, "bpm");
+        if (d != null && d > 0) song.bpm = d;
+        Boolean b = firstBool(container, global, "needsVoices");
+        if (b != null) song.needsVoices = b;
+        s = firstString(container, global, "player1");
+        if (s != null && !s.isEmpty()) song.player1 = s;
+        s = firstString(container, global, "player2");
+        if (s != null && !s.isEmpty()) song.player2 = s;
+        d = firstDouble(container, global, "speed");
+        if (d != null && d > 0) song.speed = d;
+
+        JsonValue notesVal = container.map.get("notes");
+        if (notesVal == null) notesVal = global.map.get("notes");
+        if (notesVal == null) notesVal = findDeep(global, "notes");
+
+        List<Section> sections = new ArrayList<>();
+        double accumulatedSectionTimeMs = 0.0;
+        if (notesVal instanceof JsonArray) {
+            double stepTimeMs = (60000.0 / song.bpm) / 4.0;
+            for (JsonValue nv : ((JsonArray) notesVal).values) {
+                if (!(nv instanceof JsonObject)) continue;
+                JsonObject sectionObj = (JsonObject) nv;
+                Section section = new Section();
+
+                Double steps = getDouble(sectionObj, "lengthInSteps");
+                if (steps == null || steps <= 0) {
+                    Double beats = getDouble(sectionObj, "sectionBeats");
+                    steps = (beats != null && beats > 0) ? beats * 4.0 : 16.0;
+                }
+                section.lengthInSteps = Math.max(1, (int) Math.round(steps));
+
+                Boolean mustHit = getBool(sectionObj, "mustHitSection");
+                if (mustHit != null) section.mustHitSection = mustHit;
+
+                JsonValue noteList = sectionObj.map.get("sectionNotes");
+                if (noteList instanceof JsonArray) {
+                    double sectionStartTime = accumulatedSectionTimeMs;
+                    for (JsonValue noteVal : ((JsonArray) noteList).values) {
+                        if (!(noteVal instanceof JsonArray)) continue;
+                        List<JsonValue> note = ((JsonArray) noteVal).values;
+                        if (note.size() < 3) continue;
+                        double strumTime = numberValue(note.get(0));
+                        int noteData = (int) Math.round(numberValue(note.get(1)));
+                        double sustain = numberValue(note.get(2));
+                        double relative = Math.max(0.0, strumTime - sectionStartTime);
+                        section.sectionNotes.addFast(relative, noteData,
+                                Math.max(0.0, sustain), relative / stepTimeMs, stepTimeMs);
+                    }
+                }
+
+                sections.add(section);
+                double quarterMs = 60000.0 / song.bpm;
+                accumulatedSectionTimeMs += (section.lengthInSteps / 4.0) * quarterMs;
             }
         }
-        return -1;
+
+        if (!sections.isEmpty()) {
+            song.notes = sections;
+        } else {
+            song.notes.add(new Section());
+        }
+        return song;
+    }
+
+    private static String firstString(JsonObject primary, JsonObject fallback, String key) {
+        String s = stringValue(primary.map.get(key));
+        if (s == null) s = stringValue(fallback.map.get(key));
+        return s;
+    }
+
+    private static Double firstDouble(JsonObject primary, JsonObject fallback, String key) {
+        Double d = getDouble(primary, key);
+        if (d == null) d = getDouble(fallback, key);
+        return d;
+    }
+
+    private static Boolean firstBool(JsonObject primary, JsonObject fallback, String key) {
+        Boolean b = getBool(primary, key);
+        if (b == null) b = getBool(fallback, key);
+        return b;
+    }
+
+    private static Double getDouble(JsonObject o, String key) {
+        JsonValue v = o == null ? null : o.map.get(key);
+        if (v instanceof JsonNumber) return ((JsonNumber) v).value;
+        if (v instanceof JsonString) {
+            try {
+                return Double.parseDouble(((JsonString) v).value.trim());
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static Boolean getBool(JsonObject o, String key) {
+        JsonValue v = o == null ? null : o.map.get(key);
+        if (v instanceof JsonBoolean) return ((JsonBoolean) v).value;
+        if (v instanceof JsonString) return Boolean.parseBoolean(((JsonString) v).value.trim());
+        return null;
+    }
+
+    private static String stringValue(JsonValue v) {
+        return v instanceof JsonString ? ((JsonString) v).value : null;
+    }
+
+    private static double numberValue(JsonValue v) {
+        if (v instanceof JsonNumber) return ((JsonNumber) v).value;
+        if (v instanceof JsonString) {
+            try {
+                return Double.parseDouble(((JsonString) v).value.trim());
+            } catch (Exception ignored) {
+                return 0.0;
+            }
+        }
+        return 0.0;
+    }
+
+    private static JsonValue findDeep(JsonValue node, String key) {
+        if (node instanceof JsonObject) {
+            JsonObject o = (JsonObject) node;
+            JsonValue direct = o.map.get(key);
+            if (direct != null) return direct;
+            for (JsonValue child : o.map.values()) {
+                JsonValue found = findDeep(child, key);
+                if (found != null) return found;
+            }
+        } else if (node instanceof JsonArray) {
+            for (JsonValue child : ((JsonArray) node).values) {
+                JsonValue found = findDeep(child, key);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private abstract static class JsonValue {
+    }
+
+    private static final class JsonObject extends JsonValue {
+        final Map<String, JsonValue> map = new LinkedHashMap<>();
+    }
+
+    private static final class JsonArray extends JsonValue {
+        final List<JsonValue> values = new ArrayList<>();
+    }
+
+    private static final class JsonString extends JsonValue {
+        final String value;
+        JsonString(String value) { this.value = value; }
+    }
+
+    private static final class JsonNumber extends JsonValue {
+        final double value;
+        JsonNumber(double value) { this.value = value; }
+    }
+
+    private static final class JsonBoolean extends JsonValue {
+        final boolean value;
+        JsonBoolean(boolean value) { this.value = value; }
+    }
+
+    private static final class JsonNull extends JsonValue {
+    }
+
+    private static final class JsonReader {
+        private final String text;
+        private int pos;
+
+        JsonReader(String text) { this.text = text; }
+
+        JsonValue read() throws IOException {
+            JsonValue value = readValue();
+            skipWhitespace();
+            if (pos < text.length()) throw error("Unexpected trailing characters");
+            return value;
+        }
+
+        private IOException error(String message) {
+            return new IOException(message + " at position " + pos);
+        }
+
+        private void skipWhitespace() {
+            while (pos < text.length()) {
+                char c = text.charAt(pos);
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') pos++;
+                else break;
+            }
+        }
+
+        private JsonValue readValue() throws IOException {
+            skipWhitespace();
+            if (pos >= text.length()) throw error("Unexpected end of JSON");
+            char c = text.charAt(pos);
+            switch (c) {
+                case '{': return readObject();
+                case '[': return readArray();
+                case '"': return new JsonString(readString());
+                case 't': expectKeyword("true"); return new JsonBoolean(true);
+                case 'f': expectKeyword("false"); return new JsonBoolean(false);
+                case 'n': expectKeyword("null"); return new JsonNull();
+                default: {
+                    if (c == '-' || (c >= '0' && c <= '9')) return new JsonNumber(readNumber());
+                    throw error("Unexpected character '" + c + "'");
+                }
+            }
+        }
+
+        private JsonValue readObject() throws IOException {
+            pos++; // consume '{'
+            JsonObject object = new JsonObject();
+            skipWhitespace();
+            if (pos < text.length() && text.charAt(pos) == '}') { pos++; return object; }
+            while (true) {
+                skipWhitespace();
+                if (pos >= text.length() || text.charAt(pos) != '"') throw error("Expected object key string");
+                String key = readString();
+                skipWhitespace();
+                if (pos >= text.length() || text.charAt(pos) != ':') throw error("Expected ':' after object key");
+                pos++;
+                object.map.put(key, readValue());
+                skipWhitespace();
+                if (pos >= text.length()) throw error("Unterminated object");
+                char c = text.charAt(pos);
+                if (c == ',') { pos++; continue; }
+                if (c == '}') { pos++; return object; }
+                throw error("Expected ',' or '}' in object");
+            }
+        }
+
+        private JsonValue readArray() throws IOException {
+            pos++; // consume '['
+            JsonArray array = new JsonArray();
+            skipWhitespace();
+            if (pos < text.length() && text.charAt(pos) == ']') { pos++; return array; }
+            while (true) {
+                array.values.add(readValue());
+                skipWhitespace();
+                if (pos >= text.length()) throw error("Unterminated array");
+                char c = text.charAt(pos);
+                if (c == ',') { pos++; continue; }
+                if (c == ']') { pos++; return array; }
+                throw error("Expected ',' or ']' in array");
+            }
+        }
+
+        private String readString() throws IOException {
+            pos++; // consume opening quote
+            StringBuilder sb = new StringBuilder();
+            while (pos < text.length()) {
+                char c = text.charAt(pos++);
+                if (c == '"') return sb.toString();
+                if (c == '\\') {
+                    if (pos >= text.length()) throw error("Unterminated string escape");
+                    char e = text.charAt(pos++);
+                    switch (e) {
+                        case '"': sb.append('"'); break;
+                        case '\\': sb.append('\\'); break;
+                        case '/': sb.append('/'); break;
+                        case 'b': sb.append('\b'); break;
+                        case 'f': sb.append('\f'); break;
+                        case 'n': sb.append('\n'); break;
+                        case 'r': sb.append('\r'); break;
+                        case 't': sb.append('\t'); break;
+                        case 'u': {
+                            if (pos + 4 > text.length()) throw error("Invalid unicode escape");
+                            sb.append((char) Integer.parseInt(text.substring(pos, pos + 4), 16));
+                            pos += 4;
+                            break;
+                        }
+                        default: throw error("Invalid string escape '\\" + e + "'");
+                    }
+                } else if (c < 0x20) {
+                    throw error("Unescaped control character in string");
+                } else {
+                    sb.append(c);
+                }
+            }
+            throw error("Unterminated string");
+        }
+
+        private double readNumber() throws IOException {
+            int start = pos;
+            if (pos < text.length() && text.charAt(pos) == '-') pos++;
+            while (pos < text.length()) {
+                char c = text.charAt(pos);
+                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') pos++;
+                else break;
+            }
+            String number = text.substring(start, pos);
+            try {
+                return Double.parseDouble(number);
+            } catch (NumberFormatException e) {
+                throw error("Invalid number '" + number + "'");
+            }
+        }
+
+        private void expectKeyword(String word) throws IOException {
+            if (!text.startsWith(word, pos)) throw error("Invalid JSON literal");
+            pos += word.length();
+        }
     }
 
     private void loadBinaryChart(File file) {
@@ -2072,33 +2273,6 @@ public class FNFChartEditor extends JFrame {
         byte[] bytes = new byte[len];
         in.readFully(bytes);
         return new String(bytes, StandardCharsets.UTF_8);
-    }
-
-    private String extractJSONString(String raw, String key, int startFrom) {
-        int idx = raw.indexOf("\"" + key + "\"", startFrom);
-        if (idx == -1) return "";
-        int colon = raw.indexOf(":", idx);
-        int startQuote = raw.indexOf("\"", colon);
-        if (startQuote != -1 && startQuote < raw.indexOf(",", colon)) {
-            int endQuote = raw.indexOf("\"", startQuote + 1);
-            return raw.substring(startQuote + 1, endQuote);
-        } else {
-            int nextComma = raw.indexOf(",", colon);
-            if (nextComma == -1) nextComma = raw.indexOf("}", colon);
-            return raw.substring(colon + 1, nextComma).trim();
-        }
-    }
-
-    private double extractJSONDouble(String raw, String key, int startFrom) {
-        try {
-            return Double.parseDouble(extractJSONString(raw, key, startFrom).replaceAll("[^0-9.-]", ""));
-        } catch (Exception e) {
-            return 0.0;
-        }
-    }
-
-    private boolean extractJSONBool(String raw, String key, int startFrom) {
-        return extractJSONString(raw, key, startFrom).contains("true");
     }
 
     public static void main(String[] args) {
@@ -2310,7 +2484,7 @@ public class FNFChartEditor extends JFrame {
                                 }
                             } else {
                                 boolean replaced = false;
-                                double sectionStartTime = currentSectionIndex * (4 * (60000.0 / activeSong.bpm));
+                                double sectionStartTime = currentSectionStartTimeMs();
                                 double relativeTime = Math.max(0.0, stepTime - sectionStartTime);
                                 double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
 
@@ -2411,8 +2585,22 @@ public class FNFChartEditor extends JFrame {
             repaint();
         }
 
+        private double sectionStartTimeMs(int sectionIndex) {
+            double total = 0.0;
+            double quarterMs = 60000.0 / Math.max(1.0, activeSong.bpm);
+            int limit = Math.max(0, Math.min(sectionIndex, activeSong.notes.size()));
+            for (int i = 0; i < limit; i++) {
+                total += (activeSong.notes.get(i).lengthInSteps / 4.0) * quarterMs;
+            }
+            return total;
+        }
+
+        private double currentSectionStartTimeMs() {
+            return sectionStartTimeMs(currentSectionIndex);
+        }
+
         private double rowTimeToGlobalMs(double relativeTimeMs) {
-            return currentSectionIndex * (4 * (60000.0 / activeSong.bpm)) + relativeTimeMs;
+            return currentSectionStartTimeMs() + relativeTimeMs;
         }
 
         private void extendSelectedNote() {
@@ -2431,13 +2619,13 @@ public class FNFChartEditor extends JFrame {
             sec.sectionNotes.setSustain(selectedNoteIndex, sustain, storageStepMs);
 
             sustainSpinner.setValue(sustain);
-            double sectionStartTime = currentSectionIndex * (4 * (60000.0 / activeSong.bpm));
+            double sectionStartTime = currentSectionStartTimeMs();
             strumTimeField.setText(String.format("%.2f", sectionStartTime + sec.sectionNotes.getTime(selectedNoteIndex, storageStepMs)));
             repaint();
         }
 
         private double rowToMs(int row) {
-            double sectionStartTime = currentSectionIndex * (4 * (60000.0 / activeSong.bpm));
+            double sectionStartTime = currentSectionStartTimeMs();
             // Every visual row is a real musical subdivision. Do not collapse
             // zoomed rows back to the original 16-row storage grid when mapping
             // the mouse to time.
@@ -2507,7 +2695,7 @@ public class FNFChartEditor extends JFrame {
             int minLane = Math.min(laneFrom, laneTo);
             int maxLane = Math.max(laneFrom, laneTo);
 
-            double sectionStartTime = currentSectionIndex * (4 * (60000.0 / activeSong.bpm));
+            double sectionStartTime = currentSectionStartTimeMs();
             // Visual/EZ-Spam movement follows the current zoom grid. Notes are still
             // stored in the canonical 1/16-section timing base so all zoom levels
             // (including rows beyond the original 16 buckets) remain addressable.

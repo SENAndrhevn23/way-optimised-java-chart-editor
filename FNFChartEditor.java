@@ -28,6 +28,7 @@ public class FNFChartEditor extends JFrame {
         public boolean needsVoices = true;
         public String player1 = "bf";
         public String player2 = "dad";
+        public String gfVersion = "gf";
         public double speed = 1.6;
         public String audioFilePath = ""; 
         public List<Section> notes = new ArrayList<>();
@@ -434,12 +435,18 @@ public class FNFChartEditor extends JFrame {
     }
 
     private double displayStepTimeMs() {
-        // The zoom level changes how many visual rows represent one 4/4 section.
-        // At 1/0.25 (the default) there are 16 rows, so each row is one quarter note.
-        // At 1/1 there are 64 rows, so each row is one sixteenth note.
-        double quarterNoteMs = (60000.0 / activeSong.bpm) / 4.0;
-        double visualRowsPerStorageRow = 4.0 * GRID_ZOOM_VALUES[gridZoomIndex];
-        return quarterNoteMs / visualRowsPerStorageRow;
+        // A section is stored in the canonical 1/16-note grid (16 storage steps
+        // for the normal 4/4 section). The visual grid may contain more or fewer
+        // rows because of Z/X zoom, so derive each visual row from the ACTUAL
+        // section duration instead of treating the default 16 rows as quarters.
+        // This keeps 1 visual row = 1 visual row everywhere, which is required
+        // for EZ Spam strength (1 = 1 row, 16 = 16 rows).
+        double storageStepMs = (60000.0 / Math.max(1.0, activeSong.bpm)) / 4.0;
+        Section sec = (activeSong != null && !activeSong.notes.isEmpty())
+                ? activeSong.notes.get(Math.max(0, Math.min(currentSectionIndex, activeSong.notes.size() - 1)))
+                : null;
+        double sectionDurationMs = storageStepMs * (sec == null ? GRID_STEPS_PER_SECTION : Math.max(1, sec.lengthInSteps));
+        return sectionDurationMs / Math.max(1, gridRowsForZoom());
     }
 
     private String gridZoomLabel() {
@@ -458,6 +465,7 @@ public class FNFChartEditor extends JFrame {
     private JSpinner speedSpinner;
     private JComboBox<String> player1Combo;
     private JComboBox<String> player2Combo;
+    private JComboBox<String> girlfriendCombo;
     private JCheckBox voiceTrackCheckbox;
     private JLabel audioTrackLabel;
 
@@ -487,6 +495,22 @@ public class FNFChartEditor extends JFrame {
     private boolean hasCopiedSection = false;
     private boolean copiedSectionMustHit = false;
     private int copiedSectionLengthInSteps = GRID_STEPS_PER_SECTION;
+
+    /**
+     * Internal clipboard for the Section-tab "Copy All Notes" / "Paste All Notes"
+     * actions. Only non-empty source sections are stored, so empty sections do
+     * not consume any destination sections when pasted. Notes keep their exact
+     * relative position inside each source section.
+     */
+    private static final class CopiedAllSection {
+        final NoteStore sectionNotes = new NoteStore();
+        boolean mustHitSection;
+        int lengthInSteps;
+    }
+
+    private final List<CopiedAllSection> copiedAllSections = new ArrayList<>();
+    private boolean hasCopiedAllNotes = false;
+    private long copiedAllNotesCount = 0;
 
     public FNFChartEditor() {
         setTitle("Java FNF Chart Editor");
@@ -707,11 +731,11 @@ public class FNFChartEditor extends JFrame {
         JPanel p = new JPanel(new GridLayout(0, 1, 5, 5));
         p.setBorder(new EmptyBorder(10, 10, 10, 10));
 
-        p.add(new JLabel("Spam Density (higher = closer notes):"));
+        p.add(new JLabel("Spam Density (notes per grid row):"));
         densitySpinner = new JSpinner(new SpinnerNumberModel(1, 1, Integer.MAX_VALUE, 1));
         p.add(densitySpinner);
 
-        p.add(new JLabel("Spam Strength (how many grid row units down to fill):"));
+        p.add(new JLabel("Spam Strength (grid rows to fill, 16 = full section):"));
         strengthSpinner = new JSpinner(new SpinnerNumberModel(1.0, 0.03125, Double.MAX_VALUE, 0.03125));
         p.add(strengthSpinner);
 
@@ -727,8 +751,10 @@ public class FNFChartEditor extends JFrame {
         laneRangePanel.add(laneToSpinner);
         p.add(laneRangePanel);
 
-        JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
+JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         spamNotesBtn.addActionListener(e -> {
+            commitSpinner(densitySpinner);
+            commitSpinner(strengthSpinner);
             int fromLane = (int) laneFromSpinner.getValue();
             int toLane = (int) laneToSpinner.getValue();
             int density = (int) densitySpinner.getValue();
@@ -828,6 +854,16 @@ public class FNFChartEditor extends JFrame {
         copySection.addActionListener(e -> copyCurrentSection());
         p.add(copySection);
 
+        JButton copyAllNotes = new JButton("Copy All Notes");
+        copyAllNotes.setToolTipText("Copy every note in the current chart, skipping empty sections.");
+        copyAllNotes.addActionListener(e -> copyAllNotes());
+        p.add(copyAllNotes);
+
+        JButton pasteAllNotes = new JButton("Paste All Notes");
+        pasteAllNotes.setToolTipText("Paste copied non-empty sections starting at the current section.");
+        pasteAllNotes.addActionListener(e -> pasteAllNotes());
+        p.add(pasteAllNotes);
+
         JButton pasteHereSection = new JButton("Paste Notes Section Here");
         pasteHereSection.addActionListener(e -> pasteCopiedSectionHere());
         p.add(pasteHereSection);
@@ -837,6 +873,16 @@ public class FNFChartEditor extends JFrame {
         p.add(pasteNextSection);
 
         return p;
+    }
+
+    private void commitSpinner(JSpinner spinner) {
+        if (spinner == null) return;
+        if (spinner.getEditor() instanceof JSpinner.DefaultEditor) {
+            try {
+                ((JSpinner.DefaultEditor) spinner.getEditor()).commitEdit();
+            } catch (java.text.ParseException ignored) {
+            }
+        }
     }
 
     private void swapCurrentSectionSides() {
@@ -1009,6 +1055,128 @@ public class FNFChartEditor extends JFrame {
                 JOptionPane.INFORMATION_MESSAGE);
     }
 
+    private void clearCopiedAllNotesClipboard() {
+        for (CopiedAllSection copied : copiedAllSections) {
+            copied.sectionNotes.clear();
+        }
+        copiedAllSections.clear();
+        hasCopiedAllNotes = false;
+        copiedAllNotesCount = 0;
+    }
+
+    private void copyAllNotes() {
+        if (activeSong == null || activeSong.notes == null || activeSong.notes.isEmpty()) {
+            JOptionPane.showMessageDialog(
+                    this,
+                    "There are no chart sections to copy.",
+                    "Copy All Notes",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        clearCopiedAllNotesClipboard();
+
+        int nonEmptySections = 0;
+        long totalNotes = 0;
+
+        // Copy every non-empty section in order. Empty sections are deliberately
+        // skipped so Paste All Notes does not recreate empty spacing.
+        for (Section source : activeSong.notes) {
+            if (source == null || source.sectionNotes == null || source.sectionNotes.size() == 0) {
+                continue;
+            }
+
+            CopiedAllSection copied = new CopiedAllSection();
+            copied.sectionNotes.appendFrom(source.sectionNotes);
+            copied.mustHitSection = source.mustHitSection;
+            copied.lengthInSteps = Math.max(1, source.lengthInSteps);
+            copiedAllSections.add(copied);
+
+            nonEmptySections++;
+            totalNotes += source.sectionNotes.size();
+        }
+
+        if (copiedAllSections.isEmpty()) {
+            JOptionPane.showMessageDialog(
+                    this,
+                    "There are no notes in this chart to copy.",
+                    "Copy All Notes",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        copiedAllNotesCount = totalNotes;
+        hasCopiedAllNotes = true;
+
+        JOptionPane.showMessageDialog(
+                this,
+                "Copied " + formatEveryThirdDigit(totalNotes) + " notes from "
+                        + formatEveryThirdDigit(nonEmptySections) + " non-empty sections.\n\n"
+                        + "Empty sections were ignored. Paste All Notes will place "
+                        + "the copied non-empty sections consecutively starting at the current section.",
+                "Copy All Notes",
+                JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    private void pasteAllNotes() {
+        if (!hasCopiedAllNotes || copiedAllSections.isEmpty()) {
+            JOptionPane.showMessageDialog(
+                    this,
+                    "There are no copied notes yet. Use Copy All Notes first.",
+                    "Paste All Notes",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        if (activeSong == null) return;
+        if (activeSong.notes == null) activeSong.notes = new ArrayList<>();
+        if (activeSong.notes.isEmpty()) activeSong.notes.add(new Section());
+
+        int startIndex = Math.max(0, Math.min(currentSectionIndex, activeSong.notes.size() - 1));
+        int endIndex = startIndex + copiedAllSections.size() - 1;
+
+        int answer = JOptionPane.showConfirmDialog(
+                this,
+                "Paste " + formatEveryThirdDigit(copiedAllNotesCount) + " notes from "
+                        + formatEveryThirdDigit(copiedAllSections.size()) + " non-empty sections starting at Section "
+                        + startIndex + "?\n\n"
+                        + "Existing notes in those destination sections will be replaced.\n"
+                        + "Empty source sections will NOT be pasted or counted.",
+                "Paste All Notes",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+        if (answer != JOptionPane.YES_OPTION) return;
+
+        while (activeSong.notes.size() <= endIndex) {
+            activeSong.notes.add(new Section());
+        }
+
+        int targetIndex = startIndex;
+        for (CopiedAllSection copied : copiedAllSections) {
+            Section target = activeSong.notes.get(targetIndex++);
+            target.sectionNotes.clear();
+            target.sectionNotes.appendFrom(copied.sectionNotes);
+            target.mustHitSection = copied.mustHitSection;
+            target.lengthInSteps = Math.max(1, copied.lengthInSteps);
+        }
+
+        currentSectionIndex = startIndex;
+        positionSteps = (long) startIndex * GRID_STEPS_PER_SECTION;
+        positionStepsDouble = positionSteps;
+        gridPanel.selectedNoteIndex = -1;
+        gridPanel.lastClickedRow = -1;
+        gridPanel.setScrollRowOffset(0.0);
+        gridPanel.repaint();
+
+        JOptionPane.showMessageDialog(
+                this,
+                "Pasted " + formatEveryThirdDigit(copiedAllNotesCount) + " notes into "
+                        + formatEveryThirdDigit(copiedAllSections.size()) + " consecutive sections.\n"
+                        + "Empty source sections were ignored.",
+                "Paste All Notes",
+                JOptionPane.INFORMATION_MESSAGE);
+    }
+
     private void pasteCopiedSectionHere() {
         if (!hasCopiedSection) {
             JOptionPane.showMessageDialog(
@@ -1098,13 +1266,20 @@ public class FNFChartEditor extends JFrame {
         speedSpinner = new JSpinner(new SpinnerNumberModel(1.6, 0.5, 2147483647.0, 0.1));
         p.add(speedSpinner);
 
-        p.add(new JLabel("Boyfriend (P1):"));
+        p.add(new JLabel("Boyfriend:"));
         player1Combo = new JComboBox<>(new String[]{"bf", "bf-pixel", "bf-car"});
+        player1Combo.setEditable(true);
         p.add(player1Combo);
 
-        p.add(new JLabel("Opponent (P2):"));
-        player2Combo = new JComboBox<>(new String[]{"dad", "pico", "mom", "bf-pixel-opponent"});
+        p.add(new JLabel("Daddy Dearest (Opponent):"));
+        player2Combo = new JComboBox<>(new String[]{"dad", "daddy-dearest", "pico", "mom", "bf-pixel-opponent"});
+        player2Combo.setEditable(true);
         p.add(player2Combo);
+
+        p.add(new JLabel("Girlfriend:"));
+        girlfriendCombo = new JComboBox<>(new String[]{"gf", "gf-pixel", "gf-car"});
+        girlfriendCombo.setEditable(true);
+        p.add(girlfriendCombo);
 
         voiceTrackCheckbox = new JCheckBox("Has Voices", true);
         p.add(voiceTrackCheckbox);
@@ -1341,6 +1516,7 @@ public class FNFChartEditor extends JFrame {
         activeSong.speed = (double) speedSpinner.getValue();
         activeSong.player1 = (String) player1Combo.getSelectedItem();
         activeSong.player2 = (String) player2Combo.getSelectedItem();
+        activeSong.gfVersion = (String) girlfriendCombo.getSelectedItem();
         activeSong.needsVoices = voiceTrackCheckbox.isSelected();
     }
 
@@ -1350,6 +1526,7 @@ public class FNFChartEditor extends JFrame {
         speedSpinner.setValue(activeSong.speed);
         player1Combo.setSelectedItem(activeSong.player1);
         player2Combo.setSelectedItem(activeSong.player2);
+        girlfriendCombo.setSelectedItem(activeSong.gfVersion);
         voiceTrackCheckbox.setSelected(activeSong.needsVoices);
         if(!activeSong.audioFilePath.isEmpty()) {
             audioTrackLabel.setText("Loaded: " + new File(activeSong.audioFilePath).getName());
@@ -1412,12 +1589,13 @@ public class FNFChartEditor extends JFrame {
                 throw new IOException("Unable to replace temporary save file: " + tempFile.getAbsolutePath());
             }
             out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(tempFile), 64 * 1024));
-            writeString("FNFEBIN1");
+            writeString("FNFEBIN2");
             writeString(song.song);
             out.writeDouble(song.bpm);
             out.writeBoolean(song.needsVoices);
             writeString(song.player1);
             writeString(song.player2);
+            writeString(song.gfVersion);
             out.writeDouble(song.speed);
             bytesWritten += 8 + 1 + 8;
         }
@@ -1491,6 +1669,7 @@ public class FNFChartEditor extends JFrame {
                     + ",\"needsVoices\":" + song.needsVoices
                     + ",\"player1\":\"" + escapeJson(song.player1)
                     + "\",\"player2\":\"" + escapeJson(song.player2)
+                    + "\",\"gfVersion\":\"" + escapeJson(song.gfVersion)
                     + "\",\"speed\":" + song.speed
                     + ",\"notes\":[");
         }
@@ -1923,6 +2102,8 @@ public class FNFChartEditor extends JFrame {
         if (s != null && !s.isEmpty()) song.player1 = s;
         s = firstString(container, global, "player2");
         if (s != null && !s.isEmpty()) song.player2 = s;
+        s = firstString(container, global, "gfVersion");
+        if (s != null && !s.isEmpty()) song.gfVersion = s;
         d = firstDouble(container, global, "speed");
         if (d != null && d > 0) song.speed = d;
 
@@ -2221,13 +2402,16 @@ public class FNFChartEditor extends JFrame {
     private void loadBinaryChart(File file) {
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file), 64 * 1024))) {
             String magic = readBinaryString(in);
-            if (!"FNFEBIN1".equals(magic)) throw new IOException("Unknown BIN chart format");
+            if (!magic.equals("FNFEBIN1") && !magic.equals("FNFEBIN2")) throw new IOException("Unknown BIN chart format");
             SongData loaded = new SongData();
             loaded.song = readBinaryString(in);
             loaded.bpm = in.readDouble();
             loaded.needsVoices = in.readBoolean();
             loaded.player1 = readBinaryString(in);
             loaded.player2 = readBinaryString(in);
+            if ("FNFEBIN2".equals(magic)) {
+                loaded.gfVersion = readBinaryString(in);
+            }
             loaded.speed = in.readDouble();
 
             while (true) {
@@ -2446,13 +2630,15 @@ public class FNFChartEditor extends JFrame {
                             longNoteStartSection = -1;
                             if (sustainSpinner != null) sustainSpinner.setValue(0.0);
 
+                            commitSpinner(densitySpinner);
+                            commitSpinner(strengthSpinner);
                             int density = (int) densitySpinner.getValue();
-                            // EZ Spam is anchored to exactly ONE visual grid tile. The tile
-                            // gets smaller musically as Z/X zooms in, but it remains one
-                            // complete editable grid tile. Density only controls how many
-                            // spam taps are packed INSIDE that tile; strength is intentionally
-                            // ignored here because it belongs to the full-section Spam tool.
-                            ezSpamAtGrid(clickedUserLane, clickedRow, density);
+                            int strength = Math.max(1, ((Number) strengthSpinner.getValue()).intValue());
+                            // EZ Spam uses the SAME strength control as the normal Spam tool.
+                            // Strength is the number of visual grid rows to fill starting at
+                            // the clicked row. Density only controls how many notes are packed
+                            // inside each of those rows.
+                            ezSpamAtGrid(clickedUserLane, clickedRow, density, strength);
                         } else {
                             Section currentSec = activeSong.notes.get(currentSectionIndex);
                             double stepTime = rowToMs(clickedRow);
@@ -2626,9 +2812,9 @@ public class FNFChartEditor extends JFrame {
 
         private double rowToMs(int row) {
             double sectionStartTime = currentSectionStartTimeMs();
-            // Every visual row is a real musical subdivision. Do not collapse
-            // zoomed rows back to the original 16-row storage grid when mapping
-            // the mouse to time.
+            // Every visual row is a real musical subdivision of the current section.
+            // Do not collapse visual rows back to the 16-row storage buckets when
+            // mapping the mouse to time.
             double stepTimeMs = displayStepTimeMs();
             return sectionStartTime + (row * stepTimeMs);
         }
@@ -2659,28 +2845,33 @@ public class FNFChartEditor extends JFrame {
             }
         }
 
-        private void ezSpamAtGrid(int lane, int gridRow, int densityValue) {
+        private void ezSpamAtGrid(int lane, int gridRow, int densityValue, int strengthRows) {
             Section currentSec = activeSong.notes.get(currentSectionIndex);
 
             int safeDensity = Math.max(1, densityValue);
+            int safeStrength = Math.max(1, strengthRows);
             double visualStepTimeMs = Math.max(1.0e-9, displayStepTimeMs());
             double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
             double startRelativeTime = Math.max(0.0, gridRow * visualStepTimeMs);
-            double endRelativeTime = startRelativeTime + visualStepTimeMs;
+            double endRelativeTime = startRelativeTime + (safeStrength * visualStepTimeMs);
 
-            // Replace only notes inside the clicked visual tile/lane. This keeps EZ Spam
-            // fully compatible with every zoom level, including rows between the old
-            // 1/16 storage buckets.
+            // Replace the full EZ Spam range, not just the clicked row. This is the
+            // important part of the fix: strength N now owns N visual grid rows.
             currentSec.sectionNotes.removeMatching(
                     startRelativeTime, endRelativeTime, storageStepMs, lane, lane);
 
-            // Fresh tap notes only: never inherit a previous long-note sustain.
+            // Fresh tap notes only. For each visual row, density packs notes INSIDE
+            // that row. The outer loop is an integer loop so strength 16 can never
+            // collapse back to 1 because of floating-point rounding.
             double rowStep = 1.0 / safeDensity;
-            for (double offsetRow = 0.0; offsetRow < 1.0 - 1.0e-9; offsetRow += rowStep) {
-                double relativeTime = startRelativeTime + (offsetRow * visualStepTimeMs);
-                double storageRowHint = relativeTime / storageStepMs;
-                currentSec.sectionNotes.addFast(
-                        relativeTime, lane, 0.0, storageRowHint, storageStepMs);
+            for (int row = 0; row < safeStrength; row++) {
+                double rowStartTime = startRelativeTime + (row * visualStepTimeMs);
+                for (double offset = 0.0; offset < 1.0 - 1.0e-9; offset += rowStep) {
+                    double relativeTime = rowStartTime + (offset * visualStepTimeMs);
+                    double storageRowHint = relativeTime / storageStepMs;
+                    currentSec.sectionNotes.addFast(
+                            relativeTime, lane, 0.0, storageRowHint, storageStepMs);
+                }
             }
 
             repaint();
@@ -2696,14 +2887,14 @@ public class FNFChartEditor extends JFrame {
             int maxLane = Math.max(laneFrom, laneTo);
 
             double sectionStartTime = currentSectionStartTimeMs();
-            // Visual/EZ-Spam movement follows the current zoom grid. Notes are still
-            // stored in the canonical 1/16-section timing base so all zoom levels
-            // (including rows beyond the original 16 buckets) remain addressable.
-            double visualStepTimeMs = displayStepTimeMs();
+            // Spam moves in canonical 1/16-section grid rows so "strength" always
+            // counts the 16 section grids you see at the default zoom, no matter how
+            // far in/out you zoom with Z/X. Density packs that many notes into each
+            // of those grid rows.
             double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
 
-            double startRelativeTime = Math.max(0.0, startRow * visualStepTimeMs);
-            double endRelativeTime = startRelativeTime + (safeStrength * visualStepTimeMs);
+            double startRelativeTime = Math.max(0.0, startRow * storageStepMs);
+            double endRelativeTime = startRelativeTime + (safeStrength * storageStepMs);
 
             currentSec.sectionNotes.removeMatching(
                     startRelativeTime, endRelativeTime, storageStepMs, minLane, maxLane);
@@ -2715,7 +2906,7 @@ public class FNFChartEditor extends JFrame {
             double sustain = 0.0;
 
             for (double offsetRow = 0.0; offsetRow < targetMaxRow; offsetRow += rowStep) {
-                double relativeTime = startRelativeTime + (offsetRow * visualStepTimeMs);
+                double relativeTime = startRelativeTime + (offsetRow * storageStepMs);
                 double storageRowHint = relativeTime / storageStepMs;
 
                 for (int targetLane = minLane; targetLane <= maxLane; targetLane++) {

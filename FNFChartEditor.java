@@ -30,6 +30,7 @@ public class FNFChartEditor extends JFrame {
         public String player2 = "dad";
         public String gfVersion = "gf";
         public double speed = 1.6;
+        public int mania = 8; // total lanes: K is per side, so 4K = 8 lanes and 26K = 52 lanes
         public String audioFilePath = ""; 
         public List<Section> notes = new ArrayList<>();
     }
@@ -37,41 +38,25 @@ public class FNFChartEditor extends JFrame {
     public static class Section {
         public int lengthInSteps = 16;
         public boolean mustHitSection = false;
-        /** BPM stored on this section when changeBPM is true. */
-        public double bpm = 0.0;
-        public boolean changeBPM = false;
         public final NoteStore sectionNotes = new NoteStore();
     }
 
     /**
      * Ultra-compact large-chart note storage. Each section is split into the
      * 16 grid-row buckets, and each bucket is backed by a memory-mapped file.
-     * One note is exactly 4 bytes:
-     *   bits  0..15 = time in 1/4096-grid units (0..15.9998 grids)
-     *   bits 16..28 = sustain in 1/32-grid units (0..255.96875 grids)
-     *   bits 29..31 = lane (0..7)
-     */
-    /**
-     * Disk-backed note storage for very large charts.
-     *
-     * The old implementation memory-mapped the entire note backing file as it
-     * was filled. A 3.3B-note chart is about 13.2GB at 4 bytes/note, so that
-     * strategy can exhaust native memory/page cache even though the logical
-     * chart data itself is compact.
-     *
-     * This version keeps the same compact 4-byte note record, but writes notes
-     * through buffered streams and only maps a small 4MB read window when the
-     * editor actually needs to read notes. At most 32 read windows are kept
-     * mapped at once (~128MB virtual/native mapping), rather than mapping the
-     * complete chart.
+     * One note is exactly 5 bytes:
+     *   bytes 0..3 = packed time/sustain data
+     *      bits  0..15 = time in 1/4096-grid units (0..15.9998 grids)
+     *      bits 16..28 = sustain in 1/32-grid units (0..255.96875 grids)
+     *      bits 29..31 = reserved for future packed metadata
+     *   byte 4 = lane (0..255); the editor exposes 1K..26K per side (2..52 total lanes)
      */
     public static final class NoteStore {
-        private static final int RECORD_SIZE = 4;
+        private static final int ROW_BUCKETS = 16;
+        private static final long RECORD_SIZE = 5L;
+        private static final int MAP_SEGMENT_BYTES = 64 * 1024 * 1024 - ((64 * 1024 * 1024) % (int) RECORD_SIZE);
         private static final int MAX_TIME_UNITS = 0xFFFF;
         private static final int MAX_SUSTAIN_UNITS = 0x1FFF;
-        private static final int READ_WINDOW_BYTES = 4 * 1024 * 1024;
-        private static final int MAX_READ_WINDOWS = 32;
-        private static final int OUTPUT_BUFFER_BYTES = 32 * 1024;
 
         public interface RowVisitor {
             void visit(int row, long index, double timeMs, int lane, double sustainMs);
@@ -79,13 +64,15 @@ public class FNFChartEditor extends JFrame {
 
         private static final class Bucket {
             private final Path file;
-            private DataOutputStream output;
+            private final FileChannel channel;
+            private final List<MappedByteBuffer> maps = new ArrayList<>();
             private long size;
 
             Bucket() {
                 try {
                     file = Files.createTempFile("fnf-chart-notes-", ".bin");
                     file.toFile().deleteOnExit();
+                    channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 } catch (IOException e) {
                     throw new UncheckedIOException("Unable to create large-note backing store", e);
                 }
@@ -93,234 +80,125 @@ public class FNFChartEditor extends JFrame {
 
             long size() { return size; }
 
-            private void ensureOutput() throws IOException {
-                if (output != null) return;
-                ReadWindowCache.removeBucket(this);
-                output = new DataOutputStream(new BufferedOutputStream(
-                        Files.newOutputStream(file,
-                                StandardOpenOption.CREATE,
-                                StandardOpenOption.WRITE,
-                                StandardOpenOption.APPEND),
-                        OUTPUT_BUFFER_BYTES));
-            }
-
-            void add(int packedRecord) {
+            private void ensureMapped(long recordIndex) {
+                long byteOffset = recordIndex * RECORD_SIZE;
+                int segment = (int) (byteOffset / MAP_SEGMENT_BYTES);
                 try {
-                    ensureOutput();
-                    output.writeInt(packedRecord);
-                    size++;
+                    while (maps.size() <= segment) {
+                        long segmentStart = (long) maps.size() * MAP_SEGMENT_BYTES;
+                        long requiredBytes = segmentStart + MAP_SEGMENT_BYTES;
+                        long currentLength = channel.size();
+                        if (currentLength < requiredBytes) {
+                            channel.position(requiredBytes - 1);
+                            channel.write(ByteBuffer.wrap(new byte[]{0}));
+                        }
+                        maps.add(channel.map(FileChannel.MapMode.READ_WRITE, segmentStart, MAP_SEGMENT_BYTES));
+                    }
                 } catch (IOException e) {
-                    throw new UncheckedIOException("Unable to append chart note data", e);
+                    throw new UncheckedIOException("Unable to map large-note backing store", e);
                 }
             }
 
-            void flushOutput() throws IOException {
-                if (output == null) return;
-                output.flush();
-                output.close();
-                output = null;
+            private void putRecord(long recordIndex, int packedRecord, int laneValue) {
+                ensureMapped(recordIndex);
+                long byteOffset = recordIndex * RECORD_SIZE;
+                int segment = (int) (byteOffset / MAP_SEGMENT_BYTES);
+                int segmentOffset = (int) (byteOffset % MAP_SEGMENT_BYTES);
+                MappedByteBuffer map = maps.get(segment);
+                map.putInt(segmentOffset, packedRecord);
+                map.put(segmentOffset + 4, (byte) laneValue);
             }
 
-            void setLogicalSize(long newSize) {
-                size = Math.max(0L, newSize);
+            private int getPackedInt(long recordIndex) {
+                if (recordIndex < 0 || recordIndex >= size) return 0;
+                long byteOffset = recordIndex * RECORD_SIZE;
+                int segment = (int) (byteOffset / MAP_SEGMENT_BYTES);
+                if (segment >= maps.size()) return 0;
+                int segmentOffset = (int) (byteOffset % MAP_SEGMENT_BYTES);
+                return maps.get(segment).getInt(segmentOffset);
             }
 
-            void truncateToLogicalSize() throws IOException {
-                flushOutput();
-                ReadWindowCache.removeBucket(this);
-                EditChannelCache.removeBucket(this);
-                try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
-                    channel.truncate(size * (long) RECORD_SIZE);
+            private int getLaneByte(long recordIndex) {
+                if (recordIndex < 0 || recordIndex >= size) return 0;
+                long byteOffset = recordIndex * RECORD_SIZE;
+                int segment = (int) (byteOffset / MAP_SEGMENT_BYTES);
+                if (segment >= maps.size()) return 0;
+                int segmentOffset = (int) (byteOffset % MAP_SEGMENT_BYTES);
+                return maps.get(segment).get(segmentOffset + 4) & 0xFF;
+            }
+
+            void add(int packedRecord, int laneValue) {
+                putRecord(size, packedRecord, laneValue);
+                size++;
+            }
+
+            long removeLast(long count) {
+                if (count <= 0 || size <= 0) return 0;
+                long removed = Math.min(count, size);
+                size -= removed;
+                return removed;
+            }
+
+            void setPackedInt(long index, int value) {
+                if (index < 0 || index >= size) return;
+                long byteOffset = index * RECORD_SIZE;
+                int segment = (int) (byteOffset / MAP_SEGMENT_BYTES);
+                int segmentOffset = (int) (byteOffset % MAP_SEGMENT_BYTES);
+                maps.get(segment).putInt(segmentOffset, value);
+            }
+
+            void setLaneByte(long index, int laneValue) {
+                if (index < 0 || index >= size) return;
+                long byteOffset = index * RECORD_SIZE;
+                int segment = (int) (byteOffset / MAP_SEGMENT_BYTES);
+                int segmentOffset = (int) (byteOffset % MAP_SEGMENT_BYTES);
+                maps.get(segment).put(segmentOffset + 4, (byte) laneValue);
+            }
+
+            long removeAt(long index) {
+                if (index < 0 || index >= size) return -1;
+                for (long i = index; i < size - 1; i++) {
+                    setPackedInt(i, getPackedInt(i + 1));
+                    setLaneByte(i, getLaneByte(i + 1));
                 }
+                size--;
+                return index;
             }
 
             void clear() {
+                maps.clear();
+                size = 0;
                 try {
-                    flushOutput();
-                } catch (IOException ignored) {
-                }
-                ReadWindowCache.removeBucket(this);
-                EditChannelCache.removeBucket(this);
-                try {
+                    channel.close();
                     Files.deleteIfExists(file);
                 } catch (IOException ignored) {
                 }
-                size = 0;
             }
         }
 
-        private static final class ReadWindow {
-            final Bucket bucket;
-            final long startByte;
-            final int length;
-            final FileChannel channel;
-            final MappedByteBuffer map;
-
-            ReadWindow(Bucket bucket, long startByte, int length,
-                       FileChannel channel, MappedByteBuffer map) {
-                this.bucket = bucket;
-                this.startByte = startByte;
-                this.length = length;
-                this.channel = channel;
-                this.map = map;
-            }
-
-            void closeChannel() {
-                try {
-                    channel.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
-
-        /**
-         * Shared LRU for read-only mmap windows. Keeping this cache static is
-         * important: charts can contain thousands of sections, but the process
-         * never needs thousands of simultaneously-open mapped windows.
-         */
-        private static final class ReadWindowCache {
-            private static final LinkedHashMap<String, ReadWindow> CACHE =
-                    new LinkedHashMap<>(MAX_READ_WINDOWS, 0.75f, true);
-
-            private static String key(Bucket bucket, long startByte) {
-                return bucket.file.toAbsolutePath().toString() + "@" + startByte;
-            }
-
-            static int readInt(Bucket bucket, long recordIndex) throws IOException {
-                bucket.flushOutput();
-                long byteOffset = recordIndex * (long) RECORD_SIZE;
-                long startByte = (byteOffset / READ_WINDOW_BYTES) * READ_WINDOW_BYTES;
-                int offset = (int) (byteOffset - startByte);
-                String cacheKey = key(bucket, startByte);
-
-                ReadWindow window;
-                synchronized (CACHE) {
-                    window = CACHE.get(cacheKey);
-                    if (window == null) {
-                        removeBucketLocked(bucket);
-                        FileChannel channel = FileChannel.open(bucket.file, StandardOpenOption.READ);
-                        long fileSize = channel.size();
-                        if (startByte >= fileSize) {
-                            channel.close();
-                            throw new EOFException("Chart note backing store ended unexpectedly");
-                        }
-                        int length = (int) Math.min((long) READ_WINDOW_BYTES, fileSize - startByte);
-                        MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, startByte, length);
-                        window = new ReadWindow(bucket, startByte, length, channel, mapped);
-                        CACHE.put(cacheKey, window);
-                        trimLocked();
-                    }
-                }
-
-                if (offset < 0 || offset + RECORD_SIZE > window.length) {
-                    throw new EOFException("Invalid chart note record offset");
-                }
-                return window.map.getInt(offset);
-            }
-
-            static synchronized void removeBucket(Bucket bucket) {
-                removeBucketLocked(bucket);
-            }
-
-            private static void removeBucketLocked(Bucket bucket) {
-                java.util.Iterator<Map.Entry<String, ReadWindow>> it = CACHE.entrySet().iterator();
-                while (it.hasNext()) {
-                    Map.Entry<String, ReadWindow> entry = it.next();
-                    if (entry.getValue().bucket == bucket) {
-                        entry.getValue().closeChannel();
-                        it.remove();
-                    }
-                }
-            }
-
-            private static void trimLocked() {
-                while (CACHE.size() > MAX_READ_WINDOWS) {
-                    java.util.Iterator<Map.Entry<String, ReadWindow>> it = CACHE.entrySet().iterator();
-                    if (!it.hasNext()) return;
-                    Map.Entry<String, ReadWindow> eldest = it.next();
-                    eldest.getValue().closeChannel();
-                    it.remove();
-                }
-            }
-        }
-
-        /** Small LRU of read/write channels used only for rare edit operations. */
-        private static final class EditChannelCache {
-            private static final int MAX_CHANNELS = 16;
-            private static final LinkedHashMap<Bucket, FileChannel> CACHE =
-                    new LinkedHashMap<>(MAX_CHANNELS, 0.75f, true);
-
-            static synchronized FileChannel channel(Bucket bucket) throws IOException {
-                bucket.flushOutput();
-                FileChannel channel = CACHE.get(bucket);
-                if (channel != null && channel.isOpen()) return channel;
-
-                if (channel != null) {
-                    try { channel.close(); } catch (IOException ignored) {}
-                }
-                channel = FileChannel.open(bucket.file,
-                        StandardOpenOption.READ, StandardOpenOption.WRITE);
-                CACHE.put(bucket, channel);
-                trimLocked();
-                return channel;
-            }
-
-            static synchronized void removeBucket(Bucket bucket) {
-                FileChannel channel = CACHE.remove(bucket);
-                if (channel != null) {
-                    try { channel.close(); } catch (IOException ignored) {}
-                }
-            }
-
-            private static void trimLocked() {
-                while (CACHE.size() > MAX_CHANNELS) {
-                    java.util.Iterator<Map.Entry<Bucket, FileChannel>> it = CACHE.entrySet().iterator();
-                    if (!it.hasNext()) return;
-                    Map.Entry<Bucket, FileChannel> eldest = it.next();
-                    try { eldest.getValue().close(); } catch (IOException ignored) {}
-                    it.remove();
-                }
-            }
-        }
-
-        private final Map<Integer, Bucket> buckets = new java.util.TreeMap<>();
+        private final Bucket[] buckets = new Bucket[ROW_BUCKETS];
         private long size;
-        private final long[] laneCounts = new long[8];
 
         public long size() { return size; }
 
-        public long countLane(int lane) {
-            return lane >= 0 && lane < laneCounts.length ? laneCounts[lane] : 0L;
-        }
-
         private Bucket bucket(int row, boolean create) {
-            int safeRow = Math.max(0, Math.min(1_000_000, row));
-            Bucket b = buckets.get(safeRow);
+            int safeRow = Math.max(0, Math.min(ROW_BUCKETS - 1, row));
+            Bucket b = buckets[safeRow];
             if (b == null && create) {
                 b = new Bucket();
-                buckets.put(safeRow, b);
+                buckets[safeRow] = b;
             }
             return b;
         }
 
-        /** Flush pending append buffers after a section finishes loading. */
-        public void finishWrites() {
-            for (Bucket b : buckets.values()) {
-                try {
-                    b.flushOutput();
-                } catch (IOException e) {
-                    throw new UncheckedIOException("Unable to flush chart note backing store", e);
+        public void clear() {
+            for (int i = 0; i < ROW_BUCKETS; i++) {
+                if (buckets[i] != null) {
+                    buckets[i].clear();
+                    buckets[i] = null;
                 }
             }
-        }
-
-        public void clear() {
-            for (Bucket b : buckets.values()) {
-                b.clear();
-            }
-            buckets.clear();
             size = 0;
-            java.util.Arrays.fill(laneCounts, 0L);
         }
 
         private static int pack(double localTimeMs, double sustainMs, int laneValue, double stepTimeMs) {
@@ -329,63 +207,35 @@ public class FNFChartEditor extends JFrame {
             int sustainUnits = (int) Math.round((Math.max(0.0, sustainMs) / safeStep) * 32.0);
             timeUnits = Math.max(0, Math.min(MAX_TIME_UNITS, timeUnits));
             sustainUnits = Math.max(0, Math.min(MAX_SUSTAIN_UNITS, sustainUnits));
-            int lane = Math.max(0, Math.min(7, laneValue));
-            return timeUnits | (sustainUnits << 16) | (lane << 29);
+            return timeUnits | (sustainUnits << 16);
         }
 
         private static int timeUnits(int record) { return record & 0xFFFF; }
         private static int sustainUnits(int record) { return (record >>> 16) & 0x1FFF; }
-        private static int lane(int record) { return (record >>> 29) & 0x7; }
-
-        private int readRecord(Bucket bucket, long index) {
-            if (index < 0 || index >= bucket.size()) return 0;
-            try {
-                return ReadWindowCache.readInt(bucket, index);
-            } catch (IOException e) {
-                throw new UncheckedIOException("Unable to read large-note backing store", e);
-            }
-        }
-
-        private void writeRecord(Bucket bucket, long index, int value) {
-            try {
-                bucket.flushOutput();
-                ReadWindowCache.removeBucket(bucket);
-                FileChannel channel = EditChannelCache.channel(bucket);
-                ByteBuffer buf = ByteBuffer.allocate(RECORD_SIZE);
-                buf.putInt(value).flip();
-                long offset = index * (long) RECORD_SIZE;
-                while (buf.hasRemaining()) channel.write(buf, offset + buf.position());
-            } catch (IOException e) {
-                throw new UncheckedIOException("Unable to edit large-note backing store", e);
-            }
-        }
+        private static int laneFrom(Bucket bucket, long index) { return bucket.getLaneByte(index); }
 
         public long add(double timeMs, int laneValue, double sustainMs, double rowHint, double stepTimeMs) {
             int row = (int) Math.floor(rowHint);
-            row = Math.max(0, row);
+            row = Math.max(0, Math.min(ROW_BUCKETS - 1, row));
             Bucket target = bucket(row, true);
             long globalIndex = globalOffsetForRow(row) + target.size();
-            int packedLane = Math.max(0, Math.min(7, laneValue));
-            target.add(pack(Math.max(0.0, timeMs - row * stepTimeMs), sustainMs, packedLane, stepTimeMs));
-            laneCounts[packedLane]++;
+            target.add(pack(Math.max(0.0, timeMs - row * stepTimeMs), sustainMs, laneValue, stepTimeMs), laneValue);
             size++;
             return globalIndex;
         }
 
         public void addFast(double timeMs, int laneValue, double sustainMs, double rowHint, double stepTimeMs) {
-            int row = Math.max(0, (int) Math.floor(rowHint));
-            int packedLane = Math.max(0, Math.min(7, laneValue));
-            bucket(row, true).add(pack(Math.max(0.0, timeMs - row * stepTimeMs),
-                    sustainMs, packedLane, stepTimeMs));
-            laneCounts[packedLane]++;
+            int row = (int) Math.floor(rowHint);
+            row = Math.max(0, Math.min(ROW_BUCKETS - 1, row));
+            bucket(row, true).add(pack(Math.max(0.0, timeMs - row * stepTimeMs), sustainMs, laneValue, stepTimeMs), laneValue);
             size++;
         }
 
         private long globalOffsetForRow(int row) {
             long offset = 0;
-            for (Map.Entry<Integer, Bucket> entry : buckets.entrySet()) {
-                if (entry.getKey() >= row) break;
-                offset += entry.getValue().size();
+            for (int r = 0; r < row; r++) {
+                Bucket b = buckets[r];
+                if (b != null) offset += b.size();
             }
             return offset;
         }
@@ -393,12 +243,11 @@ public class FNFChartEditor extends JFrame {
         private long[] locate(long index) {
             if (index < 0 || index >= size) return null;
             long remaining = index;
-            for (Map.Entry<Integer, Bucket> entry : buckets.entrySet()) {
-                Bucket b = entry.getValue();
-                if (remaining < b.size()) {
-                    return new long[]{entry.getKey(), remaining};
-                }
-                remaining -= b.size();
+            for (int row = 0; row < ROW_BUCKETS; row++) {
+                Bucket b = buckets[row];
+                long count = b == null ? 0 : b.size();
+                if (remaining < count) return new long[]{row, remaining};
+                remaining -= count;
             }
             return null;
         }
@@ -406,79 +255,64 @@ public class FNFChartEditor extends JFrame {
         public double getTime(long index, double stepTimeMs) {
             long[] loc = locate(index);
             if (loc == null) return 0.0;
-            return loc[0] * stepTimeMs + (timeUnits(readRecord(buckets.get((int) loc[0]), loc[1])) / 4096.0) * stepTimeMs;
+            return loc[0] * stepTimeMs + (timeUnits(buckets[(int) loc[0]].getPackedInt(loc[1])) / 4096.0) * stepTimeMs;
         }
 
         public int getLane(long index) {
             long[] loc = locate(index);
             if (loc == null) return 0;
-            return lane(readRecord(buckets.get((int) loc[0]), loc[1]));
+            return laneFrom(buckets[(int) loc[0]], loc[1]);
         }
 
         public double getSustain(long index, double stepTimeMs) {
             long[] loc = locate(index);
             if (loc == null) return 0.0;
-            return (sustainUnits(readRecord(buckets.get((int) loc[0]), loc[1])) / 32.0) * stepTimeMs;
+            return (sustainUnits(buckets[(int) loc[0]].getPackedInt(loc[1])) / 32.0) * stepTimeMs;
         }
 
         public void setSustain(long index, double sustainMs, double stepTimeMs) {
             long[] loc = locate(index);
             if (loc == null) return;
-            Bucket b = buckets.get((int) loc[0]);
-            int record = readRecord(b, loc[1]);
+            Bucket b = buckets[(int) loc[0]];
+            int record = b.getPackedInt(loc[1]);
             int sustainUnits = (int) Math.round((Math.max(0.0, sustainMs) / Math.max(1.0e-9, stepTimeMs)) * 32.0);
             sustainUnits = Math.max(0, Math.min(MAX_SUSTAIN_UNITS, sustainUnits));
             record = (record & 0xE000FFFF) | (sustainUnits << 16);
-            writeRecord(b, loc[1], record);
+            b.setPackedInt(loc[1], record);
         }
 
         public void setLane(long index, int laneValue) {
             long[] loc = locate(index);
             if (loc == null) return;
-            Bucket b = buckets.get((int) loc[0]);
-            int record = readRecord(b, loc[1]);
-            int laneValueClamped = Math.max(0, Math.min(7, laneValue));
-            int oldLane = lane(record);
-            if (oldLane != laneValueClamped) {
-                laneCounts[oldLane]--;
-                laneCounts[laneValueClamped]++;
-            }
-            record = (record & 0x1FFFFFFF) | (laneValueClamped << 29);
-            writeRecord(b, loc[1], record);
+            Bucket b = buckets[(int) loc[0]];
+            int record = b.getPackedInt(loc[1]);
+            int lane = Math.max(0, Math.min(7, laneValue));
+            record = (record & 0x1FFFFFFF) | (lane << 29);
+            b.setPackedInt(loc[1], record);
         }
 
         public void removeAt(long index) {
             long[] loc = locate(index);
             if (loc == null) return;
-            Bucket b = buckets.get((int) loc[0]);
-            int removedLane = lane(readRecord(b, loc[1]));
-            for (long i = loc[1]; i < b.size() - 1; i++) {
-                writeRecord(b, i, readRecord(b, i + 1));
-            }
-            b.setLogicalSize(b.size() - 1);
-            try {
-                b.truncateToLogicalSize();
-            } catch (IOException e) {
-                throw new UncheckedIOException("Unable to shrink chart note backing store", e);
-            }
-            laneCounts[removedLane]--;
+            Bucket b = buckets[(int) loc[0]];
+            b.removeAt(loc[1]);
             size--;
             if (b.size() == 0) {
                 b.clear();
-                buckets.remove((int) loc[0]);
+                buckets[(int) loc[0]] = null;
             }
         }
 
         public long findNoteAtTimeAndLane(double timeMs, int laneValue, double stepTimeMs, double toleranceMs) {
             double safeStep = Math.max(1.0e-9, stepTimeMs);
-            int targetLane = Math.max(0, Math.min(7, laneValue));
-            for (Map.Entry<Integer, Bucket> entry : buckets.entrySet()) {
-                int row = entry.getKey();
-                Bucket b = entry.getValue();
+            int targetLane = Math.max(0, Math.min(255, laneValue));
+            for (int row = 0; row < ROW_BUCKETS; row++) {
+                Bucket b = buckets[row];
+                if (b == null) continue;
                 long base = globalOffsetForRow(row);
                 for (long i = 0; i < b.size(); i++) {
-                    int record = readRecord(b, i);
-                    if (lane(record) != targetLane) continue;
+                    int record = b.getPackedInt(i);
+                    if (laneFrom(b, i) != targetLane) continue;
                     double noteTime = row * safeStep + (timeUnits(record) / 4096.0) * safeStep;
                     if (Math.abs(noteTime - timeMs) <= toleranceMs) {
                         return base + i;
@@ -488,6 +322,12 @@ public class FNFChartEditor extends JFrame {
             return -1;
         }
 
+        /**
+         * Removes the note at an exact time/lane without assuming that the
+         * note lives in the bucket represented by the visible grid row.
+         * A storage bucket is a coarse 1/16-step bucket; higher zoom levels
+         * can contain several visible rows inside the same bucket.
+         */
         public long removeNoteAtTimeAndLane(double timeMs, int laneValue, double stepTimeMs, double toleranceMs) {
             long index = findNoteAtTimeAndLane(timeMs, laneValue, stepTimeMs, toleranceMs);
             if (index < 0) return 0;
@@ -499,27 +339,15 @@ public class FNFChartEditor extends JFrame {
             if (count <= 0 || size <= 0) return 0;
             long remaining = Math.min(count, size);
             long removed = 0;
-            java.util.List<Integer> rows = new ArrayList<>(buckets.keySet());
-            for (int r = rows.size() - 1; r >= 0 && remaining > 0; r--) {
-                int row = rows.get(r);
-                Bucket b = buckets.get(row);
+            for (int row = ROW_BUCKETS - 1; row >= 0 && remaining > 0; row--) {
+                Bucket b = buckets[row];
                 if (b == null || b.size() == 0) continue;
-                long taken = Math.min(remaining, b.size());
-                for (long i = b.size() - taken; i < b.size(); i++) {
-                    int removedLane = lane(readRecord(b, i));
-                    laneCounts[removedLane]--;
-                }
-                b.setLogicalSize(b.size() - taken);
-                try {
-                    b.truncateToLogicalSize();
-                } catch (IOException e) {
-                    throw new UncheckedIOException("Unable to shrink chart note backing store", e);
-                }
+                long taken = b.removeLast(remaining);
                 removed += taken;
                 remaining -= taken;
                 if (b.size() == 0) {
                     b.clear();
-                    buckets.remove(row);
+                    buckets[row] = null;
                 }
             }
             size -= removed;
@@ -528,45 +356,29 @@ public class FNFChartEditor extends JFrame {
 
         public long removeMatching(double minRelativeTimeMs, double maxRelativeTimeMs,
                                    double stepTimeMs, int minLane, int maxLane) {
-            if (buckets.isEmpty()) return 0;
             long removed = 0;
-            int firstRow = Math.max(0, (int) Math.floor(minRelativeTimeMs / Math.max(1.0e-9, stepTimeMs)));
-            int lastRow = Math.max(0, (int) Math.floor(Math.max(0.0, maxRelativeTimeMs - 1e-9) / Math.max(1.0e-9, stepTimeMs)));
-            java.util.List<Integer> candidateRows = new ArrayList<>();
-            for (int row : buckets.keySet()) {
-                if (row >= firstRow && row <= lastRow) candidateRows.add(row);
-            }
-            for (int row : candidateRows) {
-                Bucket b = buckets.get(row);
+            int firstRow = Math.max(0, Math.min(ROW_BUCKETS - 1, (int) Math.floor(minRelativeTimeMs / stepTimeMs)));
+            int lastRow = Math.max(0, Math.min(ROW_BUCKETS - 1, (int) Math.floor(Math.max(0.0, maxRelativeTimeMs - 1e-9) / stepTimeMs)));
+            for (int row = firstRow; row <= lastRow; row++) {
+                Bucket b = buckets[row];
                 if (b == null) continue;
                 long i = 0;
                 while (i < b.size()) {
-                    int record = readRecord(b, i);
+                    int record = b.getPackedInt(i);
                     double time = row * stepTimeMs + (timeUnits(record) / 4096.0) * stepTimeMs;
-                    int noteLane = lane(record);
+                    int noteLane = laneFrom(b, i);
                     if (noteLane >= minLane && noteLane <= maxLane
                             && time >= minRelativeTimeMs && time < maxRelativeTimeMs) {
-                        laneCounts[noteLane]--;
-                        for (long j = i; j < b.size() - 1; j++) {
-                            writeRecord(b, j, readRecord(b, j + 1));
-                        }
-                        b.setLogicalSize(b.size() - 1);
+                        b.removeAt(i);
                         removed++;
                         size--;
                     } else {
                         i++;
                     }
                 }
-                if (b.size() > 0) {
-                    try {
-                        b.truncateToLogicalSize();
-                    } catch (IOException e) {
-                        throw new UncheckedIOException("Unable to shrink chart note backing store", e);
-                    }
-                }
                 if (b.size() == 0) {
                     b.clear();
-                    buckets.remove(row);
+                    buckets[row] = null;
                 }
             }
             return removed;
@@ -579,76 +391,56 @@ public class FNFChartEditor extends JFrame {
 
         public double rowGetTime(int row, long index, double stepTimeMs) {
             Bucket b = bucket(row, false);
-            return b == null ? 0.0 : row * stepTimeMs + (timeUnits(readRecord(b, index)) / 4096.0) * stepTimeMs;
+            return b == null ? 0.0 : row * stepTimeMs + (timeUnits(b.getPackedInt(index)) / 4096.0) * stepTimeMs;
         }
 
         public int rowGetLane(int row, long index) {
             Bucket b = bucket(row, false);
-            return b == null ? 0 : lane(readRecord(b, index));
+            return b == null ? 0 : laneFrom(b, index);
         }
 
         public double rowGetSustain(int row, long index, double stepTimeMs) {
             Bucket b = bucket(row, false);
-            return b == null ? 0.0 : (sustainUnits(readRecord(b, index)) / 32.0) * stepTimeMs;
-        }
-
-        /** Reads the compact note record once, useful for large sequential saves. */
-        public int rowGetPackedRecord(int row, long index) {
-            Bucket b = bucket(row, false);
-            return b == null ? 0 : readRecord(b, index);
-        }
-
-        public static double packedTime(int record, int row, double stepTimeMs) {
-            return row * stepTimeMs + (timeUnits(record) / 4096.0) * stepTimeMs;
-        }
-
-        public static int packedLane(int record) {
-            return lane(record);
-        }
-
-        public static double packedSustain(int record, double stepTimeMs) {
-            return (sustainUnits(record) / 32.0) * stepTimeMs;
+            return b == null ? 0.0 : (sustainUnits(b.getPackedInt(index)) / 32.0) * stepTimeMs;
         }
 
         public long globalIndexForRow(int row, long rowIndex) {
-            Bucket b = bucket(row, false);
+            if (row < 0 || row >= ROW_BUCKETS) return -1;
+            Bucket b = buckets[row];
             if (b == null || rowIndex < 0 || rowIndex >= b.size()) return -1;
             return globalOffsetForRow(row) + rowIndex;
         }
 
         public void swapLanes() {
-            for (Bucket b : buckets.values()) {
+            for (int row = 0; row < ROW_BUCKETS; row++) {
+                Bucket b = buckets[row];
+                if (b == null) continue;
                 for (long i = 0; i < b.size(); i++) {
-                    int record = readRecord(b, i);
-                    int oldLane = lane(record);
-                    int newLane = oldLane < 4 ? oldLane + 4 : oldLane - 4;
-                    writeRecord(b, i, (record & 0x1FFFFFFF) | (newLane << 29));
+                    int oldLane = b.getLaneByte(i);
+                    int newLane;
+                    if (oldLane < 8) {
+                        newLane = oldLane < 4 ? oldLane + 4 : oldLane - 4;
+                    } else {
+                        newLane = oldLane;
+                    }
+                    b.setLaneByte(i, newLane);
                 }
-            }
-            long[] oldCounts = laneCounts.clone();
-            for (int i = 0; i < 4; i++) {
-                laneCounts[i] = oldCounts[i + 4];
-                laneCounts[i + 4] = oldCounts[i];
             }
         }
 
         public void appendFrom(NoteStore source) {
             if (source == null) return;
-            for (Map.Entry<Integer, Bucket> entry : source.buckets.entrySet()) {
-                int row = entry.getKey();
-                Bucket src = entry.getValue();
+            for (int row = 0; row < ROW_BUCKETS; row++) {
+                Bucket src = source.buckets[row];
                 if (src == null || src.size() == 0) continue;
                 Bucket dst = bucket(row, true);
                 for (long i = 0; i < src.size(); i++) {
-                    int record = source.readRecord(src, i);
-                    dst.add(record);
-                    laneCounts[lane(record)]++;
+                    dst.add(src.getPackedInt(i), src.getLaneByte(i));
                 }
                 size += src.size();
             }
         }
     }
-
 
     private SongData activeSong = new SongData();
     private int currentSectionIndex = 0;
@@ -671,52 +463,6 @@ public class FNFChartEditor extends JFrame {
         return Math.max(1, (int) Math.round(64.0 * GRID_ZOOM_VALUES[gridZoomIndex]));
     }
 
-    /**
-     * Returns the BPM actually active during a section. A changeBPM section
-     * starts a new tempo; every following section inherits that tempo until
-     * another section explicitly changes it. This matches FNF/Psych-style
-     * section BPM behavior.
-     */
-    private double getEffectiveSectionBpm(Section section) {
-        if (activeSong == null || activeSong.notes == null || activeSong.notes.isEmpty()) {
-            return Math.max(1.0, activeSong == null ? 120.0 : activeSong.bpm);
-        }
-
-        int target = activeSong.notes.indexOf(section);
-        if (target < 0) {
-            return Math.max(1.0, activeSong.bpm);
-        }
-
-        double bpm = Math.max(1.0, activeSong.bpm);
-        for (int i = 0; i <= target; i++) {
-            Section s = activeSong.notes.get(i);
-            if (s != null && s.changeBPM && s.bpm > 0.0) {
-                bpm = s.bpm;
-            }
-        }
-        return bpm;
-    }
-
-    private double getSectionStartTimeMs(int sectionIndex) {
-        double total = 0.0;
-        if (activeSong == null) return 0.0;
-        int limit = Math.max(0, Math.min(sectionIndex, activeSong.notes.size()));
-        for (int i = 0; i < limit; i++) {
-            Section s = activeSong.notes.get(i);
-            double bpm = getEffectiveSectionBpm(s);
-            total += (Math.max(1, s.lengthInSteps) / 4.0) * (60000.0 / bpm);
-        }
-        return total;
-    }
-
-    private double getCurrentSectionStepTimeMs() {
-        if (activeSong == null || activeSong.notes.isEmpty()) {
-            return (60000.0 / Math.max(1.0, activeSong == null ? 120.0 : activeSong.bpm)) / 4.0;
-        }
-        Section sec = activeSong.notes.get(Math.max(0, Math.min(currentSectionIndex, activeSong.notes.size() - 1)));
-        return (60000.0 / getEffectiveSectionBpm(sec)) / 4.0;
-    }
-
     private double displayStepTimeMs() {
         // A section is stored in the canonical 1/16-note grid (16 storage steps
         // for the normal 4/4 section). The visual grid may contain more or fewer
@@ -724,11 +470,10 @@ public class FNFChartEditor extends JFrame {
         // section duration instead of treating the default 16 rows as quarters.
         // This keeps 1 visual row = 1 visual row everywhere, which is required
         // for EZ Spam strength (1 = 1 row, 16 = 16 rows).
+        double storageStepMs = (60000.0 / Math.max(1.0, activeSong.bpm)) / 4.0;
         Section sec = (activeSong != null && !activeSong.notes.isEmpty())
                 ? activeSong.notes.get(Math.max(0, Math.min(currentSectionIndex, activeSong.notes.size() - 1)))
                 : null;
-        double effectiveBpm = getEffectiveSectionBpm(sec);
-        double storageStepMs = (60000.0 / effectiveBpm) / 4.0;
         double sectionDurationMs = storageStepMs * (sec == null ? GRID_STEPS_PER_SECTION : Math.max(1, sec.lengthInSteps));
         return sectionDurationMs / Math.max(1, gridRowsForZoom());
     }
@@ -747,6 +492,7 @@ public class FNFChartEditor extends JFrame {
     private JTextField songNameField;
     private JSpinner bpmSpinner;
     private JSpinner speedSpinner;
+    private JSpinner maniaSpinner;
     private JComboBox<String> player1Combo;
     private JComboBox<String> player2Combo;
     private JComboBox<String> girlfriendCombo;
@@ -868,6 +614,21 @@ public class FNFChartEditor extends JFrame {
             }
         });
 
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_N, 0), "cameraZoomIn");
+        actionMap.put("cameraZoomIn", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) {
+                if (gridPanel != null) { gridPanel.changeCameraZoom(1); gridPanel.requestFocusInWindow(); }
+            }
+        });
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_M, 0), "cameraZoomOut");
+        actionMap.put("cameraZoomOut", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) {
+                if (gridPanel != null) { gridPanel.changeCameraZoom(-1); gridPanel.requestFocusInWindow(); }
+            }
+        });
+
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_R, 0), "swapSection");
         actionMap.put("swapSection", new AbstractAction() {
             @Override
@@ -911,7 +672,10 @@ public class FNFChartEditor extends JFrame {
                 "SPACE BAR - Start / Pause Playback (BPM Camera Follow)\n" +
                 "P - Extend Selected Long Note by 1/16 Step\n" +
                 "E - Make Selected Note Long; press again to extend by 1 grid\n" +
-                "Z/X - Zoom Grid Out / In\n" +
+                "Z/X - Zoom Grid Rows Out / In\n" +
+                "N/M - Camera Zoom In / Out\n" +
+                "J/K/I/L - Camera Left / Down / Up / Right\n" +
+                "Mania: 1K-26K per side = 2-52 total lanes\n" +
                 "W/S - Move 1 Step     A/D - Prev/Next Section\n" +
                 "Mouse Wheel - Scroll Through Grid\n" +
                 "Left Click - Place Note     Right Click - Delete Note\n\n" +
@@ -931,8 +695,11 @@ public class FNFChartEditor extends JFrame {
                 "SPACE - Start / Pause Playback\n" +
                 "E - Make selected note long; press E again to extend by 1 grid\n" +
                 "P - Extend the selected long note by exactly 1/16 step\n" +
-                "Z - Zoom Grid Out\n" +
-                "X - Zoom Grid In\n" +
+                "Z - Zoom Grid Rows Out\n" +
+                "X - Zoom Grid Rows In\n" +
+                "N - Camera Zoom In\n" +
+                "M - Camera Zoom Out\n" +
+                "J / K / I / L - Camera Left / Down / Up / Right\n" +
                 "W / S - Move 1 Step\n" +
                 "A / D - Previous / Next Section\n" +
                 "R - Swap Current Section Sides\n" +
@@ -1109,7 +876,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         JButton clearOpponentSec = new JButton("Clear Opponent Side (Lanes 0-3)");
         clearOpponentSec.addActionListener(e -> {
             Section sec = activeSong.notes.get(currentSectionIndex);
-            double stepTimeMs = getEffectiveSectionBpm(sec) > 0 ? (60000.0 / getEffectiveSectionBpm(sec)) / 4.0 : 0.0;
+            double stepTimeMs = (60000.0 / activeSong.bpm) / 4.0;
             sec.sectionNotes.removeMatching(0.0, sec.lengthInSteps * stepTimeMs, stepTimeMs, 0, 3);
             gridPanel.selectedNoteIndex = -1;
             gridPanel.repaint();
@@ -1119,7 +886,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         JButton clearPlayerSec = new JButton("Clear Player Side (Lanes 4-7)");
         clearPlayerSec.addActionListener(e -> {
             Section sec = activeSong.notes.get(currentSectionIndex);
-            double stepTimeMs = getEffectiveSectionBpm(sec) > 0 ? (60000.0 / getEffectiveSectionBpm(sec)) / 4.0 : 0.0;
+            double stepTimeMs = (60000.0 / activeSong.bpm) / 4.0;
             sec.sectionNotes.removeMatching(0.0, sec.lengthInSteps * stepTimeMs, stepTimeMs, 4, 7);
             gridPanel.selectedNoteIndex = -1;
             gridPanel.repaint();
@@ -1171,6 +938,10 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
     private void swapCurrentSectionSides() {
         if (activeSong.notes == null || activeSong.notes.isEmpty()) return;
+        // R / Swap Section Sides remains an 8K/FNF lane operation. In mania
+        // mode all lanes belong to one lane set, so swapping would only
+        // corrupt the visible lane positions.
+        if (activeSong.mania != 8) return;
         currentSectionIndex = Math.max(0, Math.min(currentSectionIndex, activeSong.notes.size() - 1));
         Section sec = activeSong.notes.get(currentSectionIndex);
         sec.sectionNotes.swapLanes();
@@ -1277,7 +1048,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             return;
         }
 
-        double stepTimeMs = getCurrentSectionStepTimeMs();
+        double stepTimeMs = (60000.0 / activeSong.bpm) / 4.0;
         copiedNote = new CopiedNote(
                 sec.sectionNotes.getTime(gridPanel.selectedNoteIndex, stepTimeMs),
                 sec.sectionNotes.getLane(gridPanel.selectedNoteIndex),
@@ -1302,7 +1073,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
         if (activeSong.notes.isEmpty()) activeSong.notes.add(new Section());
         Section sec = activeSong.notes.get(currentSectionIndex);
-        double stepTimeMs = getCurrentSectionStepTimeMs();
+        double stepTimeMs = (60000.0 / activeSong.bpm) / 4.0;
         int targetRow = gridPanel.lastClickedRow >= 0 ? gridPanel.lastClickedRow : (int) Math.floor(positionStepsDouble % GRID_STEPS_PER_SECTION);
         targetRow = Math.max(0, Math.min(GRID_STEPS_PER_SECTION - 1, targetRow));
         double targetTime = targetRow * stepTimeMs;
@@ -1531,7 +1302,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
     }
 
     private double rowTimeToGlobalMs(double relativeTimeMs) {
-        return getSectionStartTimeMs(currentSectionIndex) + relativeTimeMs;
+        return currentSectionIndex * (4 * (60000.0 / activeSong.bpm)) + relativeTimeMs;
     }
 
     private JPanel createSongTab() {
@@ -1546,8 +1317,22 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         bpmSpinner = new JSpinner(new SpinnerNumberModel(150.0, 1.0, 999999.0, 1.0));
         p.add(bpmSpinner);
 
+        p.add(new JLabel("Mania (keys per side):"));
+        maniaSpinner = new JSpinner(new SpinnerNumberModel(4, 1, 26, 1));
+        maniaSpinner.addChangeListener(e -> {
+            int keysPerSide = Math.max(1, Math.min(26, ((Number) maniaSpinner.getValue()).intValue()));
+            activeSong.mania = totalLanesForKeysPerSide(keysPerSide);
+            maniaSpinner.setToolTipText(keysPerSide + "K x 2 = " + activeSong.mania + " total lanes");
+            if (gridPanel != null) {
+                gridPanel.resetCameraForManiaChange();
+                gridPanel.repaint();
+            }
+        });
+        maniaSpinner.setToolTipText("1K-26K per side; 4K x 2 = 8 lanes, 26K x 2 = 52 lanes");
+        p.add(maniaSpinner);
+
         p.add(new JLabel("Speed:"));
-        speedSpinner = new JSpinner(new SpinnerNumberModel(1.6, 0.0, 2147483647.0, 0.1));
+        speedSpinner = new JSpinner(new SpinnerNumberModel(1.6, 0.5, 2147483647.0, 0.1));
         p.add(speedSpinner);
 
         p.add(new JLabel("Boyfriend:"));
@@ -1736,20 +1521,8 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
     }
 
     private long stepsToMs(long steps) {
-        if (activeSong == null || activeSong.notes.isEmpty() || steps <= 0) return 0L;
-        int sectionIndex = (int) Math.max(0L, Math.min((long) activeSong.notes.size() - 1, steps / GRID_STEPS_PER_SECTION));
-        double sectionStart = getSectionStartTimeMs(sectionIndex);
-        long sectionStep = steps - (long) sectionIndex * GRID_STEPS_PER_SECTION;
-        double stepMs = getCurrentSectionStepTimeMsFor(sectionIndex);
-        return (long) Math.round(sectionStart + sectionStep * stepMs);
-    }
-
-    private double getCurrentSectionStepTimeMsFor(int sectionIndex) {
-        if (activeSong == null || activeSong.notes.isEmpty()) {
-            return (60000.0 / Math.max(1.0, activeSong == null ? 120.0 : activeSong.bpm)) / 4.0;
-        }
-        int idx = Math.max(0, Math.min(sectionIndex, activeSong.notes.size() - 1));
-        return (60000.0 / getEffectiveSectionBpm(activeSong.notes.get(idx))) / 4.0;
+        double stepMs = (60000.0 / (double) bpmSpinner.getValue()) / 4.0;
+        return (long) (steps * stepMs);
     }
 
     private void applyPositionSteps(long newSteps) {
@@ -1768,7 +1541,6 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         positionSteps = newSteps;
         positionStepsDouble = newSteps;
         currentSectionIndex = (int) section;
-        updateBpmDisplayForCurrentSection();
         gridPanel.setScrollRowOffset(0.0);
     }
 
@@ -1783,7 +1555,6 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         }
         currentSectionIndex = (int) section;
         positionSteps = Math.max(0L, nextSteps);
-        updateBpmDisplayForCurrentSection();
     }
 
     private void updatePlayback() {
@@ -1794,10 +1565,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         if (deltaMs < 0) deltaMs = 0;
         lastTickMs = now;
 
-        // Playback must follow the BPM of the section currently being played.
-        // The old code used the song-level spinner BPM for the entire chart,
-        // which made imported changeBPM sections play at the initial tempo.
-        double stepMs = getCurrentSectionStepTimeMsFor(currentSectionIndex);
+        double stepMs = (60000.0 / (double) bpmSpinner.getValue()) / 4.0;
         double deltaSteps = deltaMs / stepMs;
 
         positionStepsDouble += deltaSteps;
@@ -1811,22 +1579,19 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         gridPanel.repaint();
     }
 
-    private void updateBpmDisplayForCurrentSection() {
-        if (bpmSpinner == null || activeSong == null || activeSong.notes.isEmpty()) return;
-        double bpm = getEffectiveSectionBpm(activeSong.notes.get(
-                Math.max(0, Math.min(currentSectionIndex, activeSong.notes.size() - 1))));
-        bpmSpinner.setValue(bpm);
+    private static int totalLanesForKeysPerSide(int keysPerSide) {
+        return Math.max(2, Math.min(52, keysPerSide * 2));
+    }
+
+    private static int keysPerSideForTotalLanes(int totalLanes) {
+        return Math.max(1, Math.min(26, (int) Math.round(totalLanes / 2.0)));
     }
 
     private void syncSongDataFromUI() {
         activeSong.song = songNameField.getText();
-        // BPM spinner can display the currently active section's BPM. Only
-        // write it to the song-level BPM when editing the base section.
-        if (activeSong.notes.isEmpty() || currentSectionIndex <= 0 ||
-                !activeSong.notes.get(Math.min(currentSectionIndex, activeSong.notes.size() - 1)).changeBPM) {
-            activeSong.bpm = (double) bpmSpinner.getValue();
-        }
+        activeSong.bpm = (double) bpmSpinner.getValue();
         activeSong.speed = (double) speedSpinner.getValue();
+        activeSong.mania = totalLanesForKeysPerSide(((Number) maniaSpinner.getValue()).intValue());
         activeSong.player1 = (String) player1Combo.getSelectedItem();
         activeSong.player2 = (String) player2Combo.getSelectedItem();
         activeSong.gfVersion = (String) girlfriendCombo.getSelectedItem();
@@ -1837,6 +1602,11 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         songNameField.setText(activeSong.song);
         bpmSpinner.setValue(activeSong.bpm);
         speedSpinner.setValue(activeSong.speed);
+        int totalLanes = Math.max(2, Math.min(52, activeSong.mania));
+        int keysPerSide = keysPerSideForTotalLanes(totalLanes);
+        maniaSpinner.setValue(keysPerSide);
+        maniaSpinner.setToolTipText(keysPerSide + "K x 2 = " + totalLanes + " total lanes");
+        activeSong.mania = totalLanesForKeysPerSide(keysPerSide);
         player1Combo.setSelectedItem(activeSong.player1);
         player2Combo.setSelectedItem(activeSong.player2);
         girlfriendCombo.setSelectedItem(activeSong.gfVersion);
@@ -1847,8 +1617,8 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         }
     }
 
-    private static final long JSON_ONE_GB_WARNING_BYTES = Long.MAX_VALUE;
-    private static final long MAX_FILE_BYTES = Long.MAX_VALUE;
+    private static final long JSON_ONE_GB_WARNING_BYTES = 1_000_000_000L;
+    private static final long MAX_FILE_BYTES = 2_000_000_000L;
     private static final long JSON_CLOSE_RESERVE_BYTES = 256L;
 
     private static final class SaveResult {
@@ -1910,7 +1680,8 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             writeString(song.player2);
             writeString(song.gfVersion);
             out.writeDouble(song.speed);
-            bytesWritten += 8 + 1 + 8;
+            out.writeInt(Math.max(2, Math.min(52, song.mania)));
+            bytesWritten += 8 + 1 + 8 + 4;
         }
 
         private void writeString(String value) throws IOException {
@@ -1923,13 +1694,11 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         long sizeBytes() { return bytesWritten; }
         long notesWritten() { return notesWritten; }
 
-        void writeSection(Section section) throws IOException {
+        void writeSection(Section section, long validNoteCount) throws IOException {
             out.writeInt(section.lengthInSteps);
             out.writeBoolean(section.mustHitSection);
-            out.writeDouble(section.bpm);
-            out.writeBoolean(section.changeBPM);
-            out.writeLong(section.sectionNotes.size());
-            bytesWritten += 22;
+            out.writeLong(validNoteCount);
+            bytesWritten += 13;
         }
 
         void writeNote(double globalTime, int lane, double sustain) throws IOException {
@@ -1986,6 +1755,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                     + "\",\"player2\":\"" + escapeJson(song.player2)
                     + "\",\"gfVersion\":\"" + escapeJson(song.gfVersion)
                     + "\",\"speed\":" + song.speed
+                    + ",\"mania\":" + Math.max(2, Math.min(52, song.mania))
                     + ",\"notes\":[");
         }
 
@@ -2004,8 +1774,6 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         void startSection(Section section) throws IOException {
             if (hasSection) writer.write(",");
             writer.write("{\"lengthInSteps\":" + section.lengthInSteps
-                    + ",\"bpm\":" + section.bpm
-                    + ",\"changeBPM\":" + section.changeBPM
                     + ",\"mustHitSection\":" + section.mustHitSection
                     + ",\"sectionNotes\":[");
             hasSection = true;
@@ -2034,7 +1802,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
         void finish() throws IOException {
             endSection();
-            writer.write("],\"generatedBy\":\"Java FNF Chart Editor\"}}");
+            writer.write("],\"generatedBy\":\"SNIFF ver.6\"}}");
             writer.close();
         }
 
@@ -2253,6 +2021,18 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         return "[" + format3(globalTime) + "," + lane + "," + format3(sustain) + "]";
     }
 
+    private long countSaveableNotes(Section section) {
+        long count = 0;
+        for (int row = 0; row < GRID_STEPS_PER_SECTION; row++) {
+            long rowCount = section.sectionNotes.rowSize(row);
+            for (long j = 0; j < rowCount; j++) {
+                int lane = section.sectionNotes.rowGetLane(row, j);
+                if (lane >= 0 && lane < activeSong.mania) count++;
+            }
+        }
+        return count;
+    }
+
     private void saveChart(File file, JButton buttonToDisable) {
         syncSongDataFromUI();
         boolean binary = file.getName().toLowerCase().endsWith(".bin");
@@ -2274,19 +2054,19 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
                 for (int sectionIndex = 0; sectionIndex < activeSong.notes.size(); sectionIndex++) {
                     Section section = activeSong.notes.get(sectionIndex);
-                    if (binary) binWriter.writeSection(section);
+                    long saveableSectionNotes = countSaveableNotes(section);
+                    if (binary) binWriter.writeSection(section, saveableSectionNotes);
                     else jsonWriter.startSection(section);
-                    double sectionStartTime = getSectionStartTimeMs(sectionIndex);
-                    double stepTimeMs = (60000.0 / getEffectiveSectionBpm(section)) / 4.0;
+                    double sectionStartTime = sectionIndex * (4 * (60000.0 / activeSong.bpm));
+                    double stepTimeMs = (60000.0 / activeSong.bpm) / 4.0;
 
-                    int storageRows = Math.max(GRID_STEPS_PER_SECTION, Math.max(1, section.lengthInSteps));
-                    for (int row = 0; row < storageRows; row++) {
+                    for (int row = 0; row < GRID_STEPS_PER_SECTION; row++) {
                         long rowCount = section.sectionNotes.rowSize(row);
                         for (long j = 0; j < rowCount; j++) {
-                            int record = section.sectionNotes.rowGetPackedRecord(row, j);
-                            double globalTime = sectionStartTime + NoteStore.packedTime(record, row, stepTimeMs);
-                            int lane = NoteStore.packedLane(record);
-                            double sustain = NoteStore.packedSustain(record, stepTimeMs);
+                            double globalTime = sectionStartTime + section.sectionNotes.rowGetTime(row, j, stepTimeMs);
+                            int lane = section.sectionNotes.rowGetLane(row, j);
+                            if (lane < 0 || lane >= activeSong.mania) continue;
+                            double sustain = section.sectionNotes.rowGetSustain(row, j, stepTimeMs);
                             long noteBytes = binary ? 20L : jsonWriter.noteLineBytes(makeNoteJson(globalTime, lane, sustain));
                             long currentSize = binary ? binWriter.sizeBytes() : jsonWriter.sizeBytes();
                             long projected = currentSize + noteBytes + JSON_CLOSE_RESERVE_BYTES;
@@ -2313,7 +2093,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                                     partNumber++;
                                     binWriter = new BinaryPartWriter(splitFileName(file, partNumber), activeSong);
                                     writers.add(binWriter);
-                                    binWriter.writeSection(section);
+                                    binWriter.writeSection(section, saveableSectionNotes);
                                 } else {
                                     jsonWriter.endSection(); jsonWriter.finish();
                                     File committed = jsonWriter.commit();
@@ -2374,54 +2154,25 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         return ".";
     }
 
-    private static void disposeSongData(SongData song) {
-        if (song == null || song.notes == null) return;
-        for (Section section : song.notes) {
-            if (section != null && section.sectionNotes != null) {
-                section.sectionNotes.clear();
-            }
-        }
-    }
-
     private void loadChart(File file) {
-        if (file == null || !file.exists()) return;
-        final boolean binary = file.getName().toLowerCase().endsWith(".bin");
-        final Cursor oldCursor = getCursor();
-        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-        new Thread(() -> {
-            SongData loadedSong = null;
-            try {
-                loadedSong = binary ? readBinaryChart(file) : parseChartJSONStreaming(file.toPath());
-                final SongData chartToInstall = loadedSong;
-                SwingUtilities.invokeLater(() -> {
-                    try {
-                        SongData oldSong = this.activeSong;
-                        this.activeSong = chartToInstall;
-                        disposeSongData(oldSong);
-                        this.currentSectionIndex = 0;
-                        this.positionSteps = 0;
-                        this.positionStepsDouble = 0;
-                        this.gridPanel.setScrollRowOffset(0);
-                        syncSongDataToUI();
-                        updateBpmDisplayForCurrentSection();
-                        gridPanel.repaint();
-                    } finally {
-                        setCursor(oldCursor);
-                    }
-                });
-            } catch (Exception e) {
-                SongData failedSong = loadedSong;
-                disposeSongData(failedSong);
-                SwingUtilities.invokeLater(() -> {
-                    setCursor(oldCursor);
-                    JOptionPane.showMessageDialog(
-                            this,
-                            "Error loading " + (binary ? "BIN" : "JSON") + " chart: " + e.getMessage(),
-                            "Chart Load Error",
-                            JOptionPane.ERROR_MESSAGE);
-                });
-            }
-        }, (binary ? "BIN" : "JSON") + "-Load-Thread").start();
+        if (!file.exists()) return;
+        if (file.getName().toLowerCase().endsWith(".bin")) {
+            loadBinaryChart(file);
+            return;
+        }
+        try {
+            String json = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+            SongData loadedSong = parseChartJSON(json);
+            this.activeSong = loadedSong;
+            this.currentSectionIndex = 0;
+            this.positionSteps = 0;
+            this.positionStepsDouble = 0;
+            this.gridPanel.setScrollRowOffset(0);
+            syncSongDataToUI();
+            gridPanel.repaint();
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(this, "Error parsing JSON chart: " + e.getMessage());
+        }
     }
 
     /**
@@ -2453,7 +2204,9 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         s = firstString(container, global, "gfVersion");
         if (s != null && !s.isEmpty()) song.gfVersion = s;
         d = firstDouble(container, global, "speed");
-        if (d != null && d >= 0) song.speed = d;
+        if (d != null && d > 0) song.speed = d;
+        d = firstDouble(container, global, "mania");
+        if (d != null && d > 0) song.mania = Math.max(2, Math.min(52, (int) Math.round(d)));
 
         JsonValue notesVal = container.map.get("notes");
         if (notesVal == null) notesVal = global.map.get("notes");
@@ -2461,17 +2214,12 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
         List<Section> sections = new ArrayList<>();
         double accumulatedSectionTimeMs = 0.0;
-        double currentBpm = song.bpm;
         if (notesVal instanceof JsonArray) {
+            double stepTimeMs = (60000.0 / song.bpm) / 4.0;
             for (JsonValue nv : ((JsonArray) notesVal).values) {
                 if (!(nv instanceof JsonObject)) continue;
                 JsonObject sectionObj = (JsonObject) nv;
                 Section section = new Section();
-
-                Double sectionBpm = getDouble(sectionObj, "bpm");
-                Boolean sectionChangeBpm = getBool(sectionObj, "changeBPM");
-                if (sectionBpm != null && sectionBpm > 0.0) section.bpm = sectionBpm;
-                section.changeBPM = sectionChangeBpm != null && sectionChangeBpm;
 
                 Double steps = getDouble(sectionObj, "lengthInSteps");
                 if (steps == null || steps <= 0) {
@@ -2483,12 +2231,6 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                 Boolean mustHit = getBool(sectionObj, "mustHitSection");
                 if (mustHit != null) section.mustHitSection = mustHit;
 
-                double effectiveSectionBpm = currentBpm;
-                if (section.changeBPM && section.bpm > 0.0) {
-                    effectiveSectionBpm = section.bpm;
-                }
-                double stepTimeMs = (60000.0 / Math.max(1.0, effectiveSectionBpm)) / 4.0;
-
                 JsonValue noteList = sectionObj.map.get("sectionNotes");
                 if (noteList instanceof JsonArray) {
                     double sectionStartTime = accumulatedSectionTimeMs;
@@ -2498,6 +2240,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                         if (note.size() < 3) continue;
                         double strumTime = numberValue(note.get(0));
                         int noteData = (int) Math.round(numberValue(note.get(1)));
+                        if (noteData < 0 || noteData >= song.mania) continue;
                         double sustain = numberValue(note.get(2));
                         double relative = Math.max(0.0, strumTime - sectionStartTime);
                         section.sectionNotes.addFast(relative, noteData,
@@ -2505,11 +2248,9 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                     }
                 }
 
-                section.sectionNotes.finishWrites();
                 sections.add(section);
-                double quarterMs = 60000.0 / Math.max(1.0, effectiveSectionBpm);
+                double quarterMs = 60000.0 / song.bpm;
                 accumulatedSectionTimeMs += (section.lengthInSteps / 4.0) * quarterMs;
-                currentBpm = effectiveSectionBpm;
             }
         }
 
@@ -2519,497 +2260,6 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             song.notes.add(new Section());
         }
         return song;
-    }
-
-
-    /**
-     * Streaming JSON importer for very large charts. It deliberately avoids
-     * constructing a JsonObject/JsonArray tree for sectionNotes. Notes are
-     * decoded one at a time and written directly into NoteStore's mmap-backed
-     * storage. This is the path intended for 100M+ note charts.
-     */
-    public static SongData parseChartJSONStreaming(Path path) throws IOException {
-        SongData song = new SongData();
-        try (Reader reader = new BufferedReader(new InputStreamReader(
-                Files.newInputStream(path), StandardCharsets.UTF_8), 1024 * 1024)) {
-            LargeJsonStreamParser p = new LargeJsonStreamParser(reader, song);
-            p.parseRoot();
-            for (Section section : song.notes) {
-                if (section != null) section.sectionNotes.finishWrites();
-            }
-        } catch (IOException | RuntimeException e) {
-            disposeSongData(song);
-            throw e;
-        }
-        return song;
-    }
-
-    private static final class LargeJsonStreamParser {
-        private final Reader r;
-        private final SongData song;
-        private int ch = -2;
-        private double currentBpm;
-        private double accumulatedSectionTimeMs = 0.0;
-        private boolean sawNotesArray = false;
-
-        LargeJsonStreamParser(Reader r, SongData song) {
-            this.r = r;
-            this.song = song;
-            this.currentBpm = Math.max(1.0, song.bpm);
-        }
-
-        private int peek() throws IOException {
-            if (ch == -2) ch = r.read();
-            return ch;
-        }
-
-        private int take() throws IOException {
-            int c = peek();
-            ch = -2;
-            return c;
-        }
-
-        private void ws() throws IOException {
-            while (Character.isWhitespace(peek())) take();
-        }
-
-        private int peekNonWs() throws IOException {
-            ws();
-            return peek();
-        }
-
-        private void expect(char wanted) throws IOException {
-            ws();
-            int got = take();
-            if (got != wanted) {
-                throw new IOException("Expected '" + wanted + "' in chart JSON, got '" + (char) got + "'");
-            }
-        }
-
-        private String string() throws IOException {
-            ws();
-            if (take() != '"') throw new IOException("Expected JSON string");
-            StringBuilder b = new StringBuilder(32);
-            while (true) {
-                int c = take();
-                if (c < 0) throw new EOFException("Unterminated JSON string");
-                if (c == '"') return b.toString();
-                if (c == '\\') {
-                    int e = take();
-                    switch (e) {
-                        case '"': case '\\': case '/': b.append((char) e); break;
-                        case 'b': b.append('\b'); break;
-                        case 'f': b.append('\f'); break;
-                        case 'n': b.append('\n'); break;
-                        case 'r': b.append('\r'); break;
-                        case 't': b.append('\t'); break;
-                        case 'u': {
-                            int v = 0;
-                            for (int i = 0; i < 4; i++) {
-                                int h = take();
-                                int d = Character.digit(h, 16);
-                                if (d < 0) throw new IOException("Bad unicode escape");
-                                v = (v << 4) | d;
-                            }
-                            b.append((char) v);
-                            break;
-                        }
-                        default: throw new IOException("Bad JSON escape");
-                    }
-                } else {
-                    b.append((char) c);
-                }
-            }
-        }
-
-        /** Allocation-free enough numeric reader for multi-billion-note files. */
-        private double number() throws IOException {
-            ws();
-            boolean negative = false;
-            if (peek() == '-') {
-                negative = true;
-                take();
-            }
-
-            double value = 0.0;
-            boolean haveDigits = false;
-            while (true) {
-                int c = peek();
-                if (c < '0' || c > '9') break;
-                haveDigits = true;
-                value = value * 10.0 + (take() - '0');
-            }
-
-            if (peek() == '.') {
-                take();
-                double place = 0.1;
-                while (true) {
-                    int c = peek();
-                    if (c < '0' || c > '9') break;
-                    haveDigits = true;
-                    value += (take() - '0') * place;
-                    place *= 0.1;
-                }
-            }
-
-            if (!haveDigits) throw new IOException("Bad JSON number");
-
-            int c = peek();
-            if (c == 'e' || c == 'E') {
-                take();
-                boolean expNegative = false;
-                c = peek();
-                if (c == '+' || c == '-') {
-                    expNegative = take() == '-';
-                }
-                int exponent = 0;
-                boolean expDigits = false;
-                while (true) {
-                    c = peek();
-                    if (c < '0' || c > '9') break;
-                    expDigits = true;
-                    exponent = Math.min(100000, exponent * 10 + (take() - '0'));
-                }
-                if (!expDigits) throw new IOException("Bad JSON exponent");
-                value = value * Math.pow(10.0, expNegative ? -exponent : exponent);
-            }
-
-            return negative ? -value : value;
-        }
-
-        private boolean bool() throws IOException {
-            ws();
-            int c = peek();
-            if (c == 't') {
-                for (char x : "true".toCharArray()) if (take() != x) throw new IOException("Bad boolean");
-                return true;
-            }
-            if (c == 'f') {
-                for (char x : "false".toCharArray()) if (take() != x) throw new IOException("Bad boolean");
-                return false;
-            }
-            throw new IOException("Bad boolean");
-        }
-
-        private void nullValue() throws IOException {
-            ws();
-            for (char x : "null".toCharArray()) if (take() != x) throw new IOException("Bad null");
-        }
-
-        private void skipValue() throws IOException {
-            ws();
-            int c = peek();
-            if (c == '"') { string(); return; }
-            if (c == '{') {
-                take();
-                ws();
-                if (peek() == '}') { take(); return; }
-                while (true) {
-                    string();
-                    expect(':');
-                    skipValue();
-                    ws();
-                    c = take();
-                    if (c == '}') return;
-                    if (c != ',') throw new IOException("Bad JSON object");
-                }
-            }
-            if (c == '[') {
-                take();
-                ws();
-                if (peek() == ']') { take(); return; }
-                while (true) {
-                    skipValue();
-                    ws();
-                    c = take();
-                    if (c == ']') return;
-                    if (c != ',') throw new IOException("Bad JSON array");
-                }
-            }
-            if (c == 't' || c == 'f') { bool(); return; }
-            if (c == 'n') { nullValue(); return; }
-            number();
-        }
-
-        void parseRoot() throws IOException {
-            expect('{');
-            ws();
-            if (peek() == '}') { take(); return; }
-
-            while (true) {
-                String key = string();
-                expect(':');
-                switch (key) {
-                    case "song":
-                        if (peekNonWs() == '{') parseSongObject();
-                        else if (peekNonWs() == '"') song.song = string();
-                        else skipValue();
-                        break;
-                    case "bpm":
-                        song.bpm = Math.max(1.0, number());
-                        currentBpm = song.bpm;
-                        break;
-                    case "speed": song.speed = Math.max(0.0, number()); break;
-                    case "needsVoices": song.needsVoices = bool(); break;
-                    case "player1": song.player1 = string(); break;
-                    case "player2": song.player2 = string(); break;
-                    case "gfVersion": song.gfVersion = string(); break;
-                    case "notes":
-                    case "sections":
-                        parseNotesArray();
-                        sawNotesArray = true;
-                        break;
-                    default:
-                        skipValue();
-                }
-
-                ws();
-                int c = take();
-                if (c == '}') break;
-                if (c != ',') throw new IOException("Bad root JSON object");
-            }
-
-            if (song.notes.isEmpty()) song.notes.add(new Section());
-        }
-
-        private void parseSongObject() throws IOException {
-            expect('{');
-            ws();
-            if (peek() == '}') { take(); return; }
-
-            while (true) {
-                String key = string();
-                expect(':');
-                switch (key) {
-                    case "song": if (peekNonWs() == '"') song.song = string(); else skipValue(); break;
-                    case "bpm": song.bpm = Math.max(1.0, number()); currentBpm = song.bpm; break;
-                    case "speed": song.speed = Math.max(0.0, number()); break;
-                    case "needsVoices": song.needsVoices = bool(); break;
-                    case "player1": song.player1 = string(); break;
-                    case "player2": song.player2 = string(); break;
-                    case "gfVersion": song.gfVersion = string(); break;
-                    case "notes":
-                    case "sections": parseNotesArray(); sawNotesArray = true; break;
-                    default: skipValue();
-                }
-                ws();
-                int c = take();
-                if (c == '}') break;
-                if (c != ',') throw new IOException("Bad song object");
-            }
-        }
-
-        private void parseNotesArray() throws IOException {
-            expect('[');
-            ws();
-            if (peek() == ']') { take(); return; }
-
-            while (true) {
-                ws();
-                int c = peek();
-                if (c == '{') {
-                    parseFlexibleObjectEntry();
-                } else if (c == '[') {
-                    // Flat legacy array: [time, lane/data, sustain]
-                    parseFlatNoteTuple();
-                } else {
-                    throw new IOException("Unsupported note/section entry in notes array");
-                }
-
-                ws();
-                c = take();
-                if (c == ']') break;
-                if (c != ',') throw new IOException("Bad notes array");
-            }
-        }
-
-        private void parseFlexibleObjectEntry() throws IOException {
-            Section sec = new Section();
-            boolean hasSectionNotes = false;
-            boolean hasSectionMetadata = false;
-            boolean hasFlatNote = false;
-            double noteTime = 0.0;
-            int noteLane = 0;
-            double noteSustain = 0.0;
-
-            expect('{');
-            ws();
-            if (peek() == '}') { take(); return; }
-
-            while (true) {
-                String key = string();
-                expect(':');
-                switch (key) {
-                    case "bpm":
-                        sec.bpm = number();
-                        hasSectionMetadata = true;
-                        break;
-                    case "changeBPM":
-                        sec.changeBPM = bool();
-                        hasSectionMetadata = true;
-                        break;
-                    case "lengthInSteps":
-                        sec.lengthInSteps = Math.max(1, (int) Math.round(number()));
-                        hasSectionMetadata = true;
-                        break;
-                    case "sectionBeats":
-                        sec.lengthInSteps = Math.max(1, (int) Math.round(number() * 4.0));
-                        hasSectionMetadata = true;
-                        break;
-                    case "mustHitSection":
-                        sec.mustHitSection = bool();
-                        hasSectionMetadata = true;
-                        break;
-                    case "sectionNotes":
-                        parseSectionNotes(sec);
-                        hasSectionNotes = true;
-                        hasSectionMetadata = true;
-                        break;
-                    case "time":
-                    case "strumTime":
-                    case "timeMs":
-                        noteTime = number();
-                        hasFlatNote = true;
-                        break;
-                    case "data":
-                    case "lane":
-                    case "noteData":
-                    case "direction":
-                        noteLane = (int) Math.round(number());
-                        hasFlatNote = true;
-                        break;
-                    case "sustain":
-                    case "sustainLength":
-                    case "length":
-                    case "duration":
-                        noteSustain = Math.max(0.0, number());
-                        hasFlatNote = true;
-                        break;
-                    default:
-                        skipValue();
-                }
-
-                ws();
-                int c = take();
-                if (c == '}') break;
-                if (c != ',') throw new IOException("Bad note/section object");
-            }
-
-            if (hasSectionNotes || hasSectionMetadata) {
-                double effective = currentBpm;
-                if (sec.changeBPM && sec.bpm > 0.0) effective = sec.bpm;
-                double quarter = 60000.0 / Math.max(1.0, effective);
-                accumulatedSectionTimeMs += (sec.lengthInSteps / 4.0) * quarter;
-                currentBpm = effective;
-                sec.sectionNotes.finishWrites();
-                song.notes.add(sec);
-            } else if (hasFlatNote) {
-                addFlatNote(noteTime, noteLane, noteSustain);
-            }
-        }
-
-        private void parseSectionNotes(Section sec) throws IOException {
-            double effective = currentBpm;
-            if (sec.changeBPM && sec.bpm > 0.0) effective = sec.bpm;
-            double step = (60000.0 / Math.max(1.0, effective)) / 4.0;
-
-            expect('[');
-            ws();
-            if (peek() == ']') { take(); return; }
-
-            while (true) {
-                ws();
-                if (peek() == '[') {
-                    expect('[');
-                    double t = number();
-                    expect(',');
-                    int lane = (int) Math.round(number());
-                    expect(',');
-                    double sustain = number();
-
-                    // Accept optional tuple fields used by some engines.
-                    ws();
-                    while (peek() != ']') {
-                        expect(',');
-                        skipValue();
-                        ws();
-                    }
-                    expect(']');
-
-                    double relative = Math.max(0.0, t - accumulatedSectionTimeMs);
-                    sec.sectionNotes.addFast(relative, lane, Math.max(0.0, sustain), relative / step, step);
-                } else if (peek() == '{') {
-                    parseSectionNoteObject(sec, step);
-                } else {
-                    throw new IOException("Unsupported section note entry");
-                }
-
-                ws();
-                int c = take();
-                if (c == ']') break;
-                if (c != ',') throw new IOException("Bad sectionNotes array");
-            }
-        }
-
-        private void parseSectionNoteObject(Section sec, double step) throws IOException {
-            double t = 0.0;
-            int lane = 0;
-            double sustain = 0.0;
-            boolean gotTime = false;
-            boolean gotLane = false;
-
-            expect('{');
-            ws();
-            if (peek() == '}') { take(); return; }
-            while (true) {
-                String key = string();
-                expect(':');
-                switch (key) {
-                    case "time": case "strumTime": case "timeMs": t = number(); gotTime = true; break;
-                    case "data": case "lane": case "noteData": case "direction": lane = (int) Math.round(number()); gotLane = true; break;
-                    case "sustain": case "sustainLength": case "length": case "duration": sustain = Math.max(0.0, number()); break;
-                    default: skipValue();
-                }
-                ws();
-                int c = take();
-                if (c == '}') break;
-                if (c != ',') throw new IOException("Bad section note object");
-            }
-            if (gotTime && gotLane) {
-                double relative = Math.max(0.0, t - accumulatedSectionTimeMs);
-                sec.sectionNotes.addFast(relative, lane, sustain, relative / step, step);
-            }
-        }
-
-        private void parseFlatNoteTuple() throws IOException {
-            expect('[');
-            double t = number();
-            expect(',');
-            int lane = (int) Math.round(number());
-            expect(',');
-            double sustain = number();
-            ws();
-            while (peek() != ']') {
-                expect(',');
-                skipValue();
-                ws();
-            }
-            expect(']');
-            addFlatNote(t, lane, sustain);
-        }
-
-        private void addFlatNote(double globalTime, int lane, double sustain) {
-            double step = (60000.0 / Math.max(1.0, currentBpm)) / 4.0;
-            double sectionDuration = step * GRID_STEPS_PER_SECTION;
-            int sectionIndex = (int) Math.floor(Math.max(0.0, globalTime) / Math.max(1.0e-9, sectionDuration));
-            if (sectionIndex > 10_000_000) {
-                throw new IllegalStateException("Flat-note chart expands to an unreasonable number of sections");
-            }
-            while (song.notes.size() <= sectionIndex) song.notes.add(new Section());
-            Section sec = song.notes.get(sectionIndex);
-            double relative = Math.max(0.0, globalTime - sectionIndex * sectionDuration);
-            sec.sectionNotes.addFast(relative, lane, Math.max(0.0, sustain), relative / step, step);
-        }
     }
 
     private static String firstString(JsonObject primary, JsonObject fallback, String key) {
@@ -3251,13 +2501,10 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         }
     }
 
-    private SongData readBinaryChart(File file) throws IOException {
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file), 1024 * 1024))) {
+    private void loadBinaryChart(File file) {
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file), 64 * 1024))) {
             String magic = readBinaryString(in);
-            if (!magic.equals("FNFEBIN1") && !magic.equals("FNFEBIN2") && !magic.equals("FNFEBIN3")) {
-                throw new IOException("Unknown BIN chart format: " + magic);
-            }
-
+            if (!magic.equals("FNFEBIN1") && !magic.equals("FNFEBIN2") && !magic.equals("FNFEBIN3")) throw new IOException("Unknown BIN chart format");
             SongData loaded = new SongData();
             loaded.song = readBinaryString(in);
             loaded.bpm = in.readDouble();
@@ -3268,69 +2515,48 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                 loaded.gfVersion = readBinaryString(in);
             }
             loaded.speed = in.readDouble();
-
-            double sectionStartTime = 0.0;
-            double currentBpm = Math.max(1.0, loaded.bpm);
+            if ("FNFEBIN3".equals(magic)) {
+                loaded.mania = Math.max(2, Math.min(52, in.readInt()));
+            }
 
             while (true) {
                 try {
                     int length = in.readInt();
                     boolean mustHit = in.readBoolean();
-                    double sectionBpm = 0.0;
-                    boolean changeBPM = false;
-                    long noteCount;
-
-                    if ("FNFEBIN3".equals(magic)) {
-                        sectionBpm = in.readDouble();
-                        changeBPM = in.readBoolean();
-                        noteCount = in.readLong();
-                    } else {
-                        noteCount = in.readLong();
-                    }
-
+                    long noteCount = in.readLong();
                     if (length == 0 && noteCount == 0) break;
-                    if (length <= 0) throw new IOException("Invalid BIN section length: " + length);
-                    if (noteCount < 0 || noteCount > 10_000_000_000L) {
-                        throw new IOException("Invalid BIN note count: " + noteCount);
-                    }
-
                     Section section = new Section();
                     section.lengthInSteps = length;
                     section.mustHitSection = mustHit;
-                    if ("FNFEBIN3".equals(magic)) {
-                        section.bpm = sectionBpm;
-                        section.changeBPM = changeBPM;
-                    }
-
-                    double effectiveBpm = currentBpm;
-                    if (section.changeBPM && section.bpm > 0.0) effectiveBpm = section.bpm;
-                    double stepTimeMs = (60000.0 / Math.max(1.0, effectiveBpm)) / 4.0;
-
+                    double stepTimeMs = (60000.0 / loaded.bpm) / 4.0;
+                    double sectionStartTime = loaded.notes.size() * (4 * (60000.0 / loaded.bpm));
                     for (long i = 0; i < noteCount; i++) {
                         double globalTime = in.readDouble();
                         int lane = in.readInt();
+                        if (lane < 0 || lane >= loaded.mania) {
+                            in.readDouble();
+                            continue;
+                        }
                         double sustain = in.readDouble();
                         double relative = globalTime - sectionStartTime;
-                        // BIN files written by this editor store global times. Keep the
-                        // real fractional position instead of forcing it into row 0 when
-                        // a section starts after a long chart.
-                        if (relative < -0.5) relative = 0.0;
-                        section.sectionNotes.addFast(relative, lane, sustain,
-                                relative / stepTimeMs, stepTimeMs);
+                        section.sectionNotes.addFast(relative, lane, sustain, relative / stepTimeMs, stepTimeMs);
                     }
-
-                    section.sectionNotes.finishWrites();
                     loaded.notes.add(section);
-                    double quarterMs = 60000.0 / Math.max(1.0, effectiveBpm);
-                    sectionStartTime += (section.lengthInSteps / 4.0) * quarterMs;
-                    currentBpm = effectiveBpm;
                 } catch (EOFException eof) {
                     break;
                 }
             }
 
             if (loaded.notes.isEmpty()) loaded.notes.add(new Section());
-            return loaded;
+            activeSong = loaded;
+            currentSectionIndex = 0;
+            positionSteps = 0;
+            positionStepsDouble = 0;
+            gridPanel.setScrollRowOffset(0);
+            syncSongDataToUI();
+            gridPanel.repaint();
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(this, "Error parsing BIN chart: " + e.getMessage(), "BIN Load Error", JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -3417,9 +2643,12 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         private BufferedImage dadIcon;
         private BufferedImage[] noteArrows = new BufferedImage[8];
 
-        private int rowHeight = 60;
+        private static final double[] CAMERA_ZOOM_VALUES = {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
+        private int cameraZoomIndex = 3; // 1.0x
+        private double cameraXOffset = 0.0;
+        private double rowHeight = 60.0;
         private int stepsPerSection = 64;
-        private int laneWidth = 60; 
+        private double laneWidth = 60.0;
         private int gridStartX = 50;
         private int gridStartY = 60; 
 
@@ -3452,7 +2681,65 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         }
 
         public void setScrollRowOffset(double offset) {
-            this.scrollRowOffset = Math.max(0.0, offset);
+            int visibleRows = Math.max(1, (int) Math.floor((getHeight() - gridStartY) / effectiveRowHeight()));
+            double maxScroll = Math.max(0.0, stepsPerSection - visibleRows);
+            this.scrollRowOffset = Math.max(0.0, Math.min(maxScroll, offset));
+            repaint();
+        }
+
+        private int maniaKeyCount() {
+            return Math.max(2, Math.min(52, activeSong == null ? 8 : activeSong.mania));
+        }
+
+        private double effectiveLaneWidth() {
+            return 60.0 * CAMERA_ZOOM_VALUES[cameraZoomIndex];
+        }
+
+        private double effectiveRowHeight() {
+            return 60.0 * CAMERA_ZOOM_VALUES[cameraZoomIndex];
+        }
+
+        public void changeCameraZoom(int delta) {
+            int next = Math.max(0, Math.min(CAMERA_ZOOM_VALUES.length - 1, cameraZoomIndex + delta));
+            if (next == cameraZoomIndex) return;
+
+            double oldLaneWidth = effectiveLaneWidth();
+            double oldRowHeight = effectiveRowHeight();
+            double centerX = Math.max(0.0, (getWidth() - gridStartX) * 0.5);
+            double centerWorldX = cameraXOffset + centerX;
+            double centerRows = scrollRowOffset + Math.max(0.0, (getHeight() - gridStartY) * 0.5) / oldRowHeight;
+
+            cameraZoomIndex = next;
+            double newLaneWidth = effectiveLaneWidth();
+            double newRowHeight = effectiveRowHeight();
+            cameraXOffset = Math.max(0.0, centerWorldX - centerX);
+            scrollRowOffset = Math.max(0.0, centerRows - Math.max(0.0, (getHeight() - gridStartY) * 0.5) / newRowHeight);
+            clampCamera();
+            repaint();
+        }
+
+        public void moveCamera(int dx, int dy) {
+            double laneStep = effectiveLaneWidth();
+            double rowStep = Math.max(1.0, (getHeight() - gridStartY) / (effectiveRowHeight() * 8.0));
+            cameraXOffset += dx * laneStep;
+            scrollRowOffset += dy * rowStep;
+            clampCamera();
+            repaint();
+        }
+
+        private void clampCamera() {
+            double worldWidth = maniaKeyCount() * effectiveLaneWidth();
+            double viewportWidth = Math.max(1.0, getWidth() - gridStartX);
+            double maxX = Math.max(0.0, worldWidth - viewportWidth);
+            cameraXOffset = Math.max(0.0, Math.min(maxX, cameraXOffset));
+
+            int visibleRows = Math.max(1, (int) Math.floor((getHeight() - gridStartY) / effectiveRowHeight()));
+            double maxScroll = Math.max(0.0, stepsPerSection - visibleRows);
+            scrollRowOffset = Math.max(0.0, Math.min(maxScroll, scrollRowOffset));
+        }
+
+        public void resetCameraForManiaChange() {
+            clampCamera();
             repaint();
         }
 
@@ -3461,7 +2748,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             if (playheadRowBase < 0) playheadRowBase += GRID_STEPS_PER_SECTION;
             double playheadRow = playheadRowBase * (stepsPerSection / (double) GRID_STEPS_PER_SECTION);
 
-            int visibleRows = Math.max(1, (getHeight() - gridStartY) / rowHeight);
+            int visibleRows = Math.max(1, (int) Math.floor((getHeight() - gridStartY) / effectiveRowHeight()));
             double maxScroll = Math.max(0.0, stepsPerSection - visibleRows);
             double followPoint = Math.min(4.0, Math.max(1.0, visibleRows / 2.0));
             double target = playheadRow - followPoint;
@@ -3471,11 +2758,11 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         }
 
         private int mapUserLaneToVisualLane(int noteData) {
-            return Math.max(0, Math.min(7, noteData));
+            return Math.max(0, Math.min(maniaKeyCount() - 1, noteData));
         }
 
-        private int visualLaneToUserLane(int visualLane0to7) {
-            return Math.max(0, Math.min(7, visualLane0to7));
+        private int visualLaneToUserLane(int visualLane) {
+            return Math.max(0, Math.min(maniaKeyCount() - 1, visualLane));
         }
 
         public ChartGridPanel() {
@@ -3489,8 +2776,8 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                 public void mousePressed(MouseEvent e) {
                     requestFocusInWindow();
 
-                    int clickedLaneVisual = (e.getX() - gridStartX) / laneWidth;
-                    double rawDisplayRow = ((e.getY() - gridStartY) / (double) rowHeight) + scrollRowOffset;
+                    int clickedLaneVisual = (int) Math.floor((e.getX() - gridStartX + cameraXOffset) / effectiveLaneWidth());
+                    double rawDisplayRow = ((e.getY() - gridStartY) / effectiveRowHeight()) + scrollRowOffset;
                     int clickedRow = (int) Math.floor(rawDisplayRow + 1.0e-9);
 
                     // The zoomed grid is a visual subdivision of the same 4-beat
@@ -3500,7 +2787,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                     if (e.getY() < gridStartY || e.getX() < gridStartX) return;
                     if (clickedRow < 0 || clickedRow >= stepsPerSection) return;
 
-                    if (clickedLaneVisual >= 0 && clickedLaneVisual < 8) {
+                    if (clickedLaneVisual >= 0 && clickedLaneVisual < maniaKeyCount()) {
                         int clickedUserLane = visualLaneToUserLane(clickedLaneVisual);
                         lastClickedRow = clickedRow;
                         lastClickedLane = clickedUserLane;
@@ -3528,7 +2815,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                             double stepTimeMs = displayStepTimeMs();
 
                             double sustain = 0.0;
-                            double timeTol = Math.max(0.05, getCurrentSectionStepTimeMs() * 0.02);
+                            double timeTol = Math.max(0.05, ((60000.0 / activeSong.bpm) / 4.0) * 0.02);
                             // A new click always selects a fresh note. Long-note editing is
                             // explicit through E/P and never carries into the next note.
                             longNoteMode = false;
@@ -3537,8 +2824,8 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                             
                             if (SwingUtilities.isRightMouseButton(e)) {
                                 double relativeTime = Math.max(0.0, stepTime
-                                        - getSectionStartTimeMs(currentSectionIndex));
-                                double storageStepMs = getCurrentSectionStepTimeMs();
+                                        - (currentSectionIndex * (4 * (60000.0 / activeSong.bpm))));
+                                double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
                                 double deleteTolerance = Math.max(0.5, (displayStepTimeMs() * 0.45));
 
                                 // Delete against the note's real chart time. Do not assume
@@ -3555,7 +2842,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                                 boolean replaced = false;
                                 double sectionStartTime = currentSectionStartTimeMs();
                                 double relativeTime = Math.max(0.0, stepTime - sectionStartTime);
-                                double storageStepMs = getCurrentSectionStepTimeMs();
+                                double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
 
                                 // Treat the clicked grid cell as the identity of the note.
                                 // This prevents a second click on the same visual cell from
@@ -3587,7 +2874,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             });
 
             addMouseWheelListener(e -> {
-                int visibleRows = Math.max(1, (getHeight() - gridStartY) / rowHeight);
+                int visibleRows = Math.max(1, (int) Math.floor((getHeight() - gridStartY) / effectiveRowHeight()));
                 double maxScroll = Math.max(0.0, stepsPerSection - visibleRows);
                 double nextOffset = scrollRowOffset + (e.getWheelRotation() * 1.0);
                 nextOffset = Math.max(0.0, Math.min(maxScroll, nextOffset));
@@ -3606,6 +2893,20 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
                     if (keyCode == KeyEvent.VK_R) {
                         swapCurrentSectionSides();
+                        return;
+                    }
+
+                    if (keyCode == KeyEvent.VK_J) {
+                        moveCamera(-1, 0);
+                        return;
+                    } else if (keyCode == KeyEvent.VK_L) {
+                        moveCamera(1, 0);
+                        return;
+                    } else if (keyCode == KeyEvent.VK_I) {
+                        moveCamera(0, -1);
+                        return;
+                    } else if (keyCode == KeyEvent.VK_K) {
+                        moveCamera(0, 1);
                         return;
                     }
 
@@ -3645,7 +2946,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             // Sustain is stored in the canonical 1/16-note storage grid.
             // The visual grid may be zoomed, but one E press must add exactly
             // one displayed grid interval without scaling the existing sustain.
-            double storageStepMs = getCurrentSectionStepTimeMs();
+            double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
             double gridStepMs = displayStepTimeMs();
             double sustain = sec.sectionNotes.getSustain(selectedNoteIndex, storageStepMs);
             sustain = Math.max(0.0, sustain) + gridStepMs;
@@ -3655,10 +2956,13 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
         }
 
         private double sectionStartTimeMs(int sectionIndex) {
-            // Use the shared BPM-aware calculation so every previous section
-            // keeps its own tempo instead of incorrectly using the current
-            // section's BPM for the entire chart.
-            return getSectionStartTimeMs(sectionIndex);
+            double total = 0.0;
+            double quarterMs = 60000.0 / Math.max(1.0, activeSong.bpm);
+            int limit = Math.max(0, Math.min(sectionIndex, activeSong.notes.size()));
+            for (int i = 0; i < limit; i++) {
+                total += (activeSong.notes.get(i).lengthInSteps / 4.0) * quarterMs;
+            }
+            return total;
         }
 
         private double currentSectionStartTimeMs() {
@@ -3678,7 +2982,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             // Each E press adds exactly one current visual grid interval.
             // Read/write sustain using the canonical storage step so zoom level
             // never causes the existing sustain to be multiplied or halved.
-            double storageStepMs = getCurrentSectionStepTimeMs();
+            double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
             double gridStepMs = displayStepTimeMs();
             double sustain = sec.sectionNotes.getSustain(selectedNoteIndex, storageStepMs);
             sustain = Math.max(0.0, sustain) + gridStepMs;
@@ -3731,7 +3035,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             int safeDensity = Math.max(1, densityValue);
             int safeStrength = Math.max(1, strengthRows);
             double visualStepTimeMs = Math.max(1.0e-9, displayStepTimeMs());
-            double storageStepMs = getCurrentSectionStepTimeMs();
+            double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
             double startRelativeTime = Math.max(0.0, gridRow * visualStepTimeMs);
             double endRelativeTime = startRelativeTime + (safeStrength * visualStepTimeMs);
 
@@ -3771,7 +3075,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             // counts the 16 section grids you see at the default zoom, no matter how
             // far in/out you zoom with Z/X. Density packs that many notes into each
             // of those grid rows.
-            double storageStepMs = getCurrentSectionStepTimeMs();
+            double storageStepMs = (60000.0 / activeSong.bpm) / 4.0;
 
             double startRelativeTime = Math.max(0.0, startRow * storageStepMs);
             double endRelativeTime = startRelativeTime + (safeStrength * storageStepMs);
@@ -3812,7 +3116,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             long notesInThisSection = secForCount.sectionNotes.size();
 
             long renderedNotes = 0;
-            double stepTimeMs = getCurrentSectionStepTimeMs();
+            double stepTimeMs = (60000.0 / activeSong.bpm) / 4.0;
 
             g2d.setColor(Color.WHITE);
             g2d.drawString(
@@ -3822,58 +3126,73 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                 20, 20
             );
 
+            int keyCount = maniaKeyCount();
+            int keysPerSide = keysPerSideForTotalLanes(keyCount);
+            double drawLaneWidth = effectiveLaneWidth();
+            double drawRowHeight = effectiveRowHeight();
+            boolean maniaMode = keyCount != 8;
             boolean mustHit = activeSong.notes.get(currentSectionIndex).mustHitSection;
             BufferedImage leftSideIcon = mustHit ? bfIcon : dadIcon;
             BufferedImage rightSideIcon = mustHit ? dadIcon : bfIcon;
 
-            if (leftSideIcon != null) {
-                g2d.drawImage(leftSideIcon, gridStartX + (2 * laneWidth) - 25, gridStartY - 50, 50, 50, null);
-            } else {
-                g2d.setColor(Color.RED);
-                g2d.drawString(mustHit ? "BF Side" : "DAD Side", gridStartX + laneWidth, gridStartY - 15);
-            }
+            if (!maniaMode) {
+                if (leftSideIcon != null) {
+                    int iconX = (int) Math.round(gridStartX + (2 * drawLaneWidth) - 25 - cameraXOffset);
+                    g2d.drawImage(leftSideIcon, iconX, gridStartY - 50, 50, 50, null);
+                } else {
+                    g2d.setColor(Color.RED);
+                    g2d.drawString(mustHit ? "BF Side" : "DAD Side", (int) Math.round(gridStartX + drawLaneWidth - cameraXOffset), gridStartY - 15);
+                }
 
-            if (rightSideIcon != null) {
-                g2d.drawImage(rightSideIcon, gridStartX + (6 * laneWidth) - 25, gridStartY - 50, 50, 50, null);
-            } else {
-                g2d.setColor(Color.GREEN);
-                g2d.drawString(mustHit ? "DAD Side" : "BF Side", gridStartX + (5 * laneWidth), gridStartY - 15);
+                if (rightSideIcon != null) {
+                    int iconX = (int) Math.round(gridStartX + (6 * drawLaneWidth) - 25 - cameraXOffset);
+                    g2d.drawImage(rightSideIcon, iconX, gridStartY - 50, 50, 50, null);
+                } else {
+                    g2d.setColor(Color.GREEN);
+                    g2d.drawString(mustHit ? "DAD Side" : "BF Side", (int) Math.round(gridStartX + (5 * drawLaneWidth) - cameraXOffset), gridStartY - 15);
+                }
             }
+            g2d.setColor(Color.WHITE);
+            g2d.drawString("Mania: " + keysPerSide + "K (" + keyCount + " total lanes)", 20, 38);
 
             for (int rowActual = 0; rowActual < stepsPerSection; rowActual++) {
-                int rowY = gridStartY + (int) Math.round((rowActual - scrollRowOffset) * rowHeight);
-                if (rowY + rowHeight < gridStartY || rowY > getHeight()) continue;
+                int rowY = gridStartY + (int) Math.round((rowActual - scrollRowOffset) * drawRowHeight);
+                if (rowY + drawRowHeight < gridStartY || rowY > getHeight()) continue;
 
-                for (int laneVisual = 0; laneVisual < 8; laneVisual++) {
-                    int x = gridStartX + (laneVisual * laneWidth);
+                for (int laneVisual = 0; laneVisual < keyCount; laneVisual++) {
+                    int x = (int) Math.round(gridStartX + (laneVisual * drawLaneWidth) - cameraXOffset);
 
                     BufferedImage gridImg = ((rowActual / 4) % 2 == 0) ? gridGrey : gridWhite;
                     if (gridImg != null) {
-                        g2d.drawImage(gridImg, x, rowY, laneWidth, rowHeight, null);
+                        g2d.drawImage(gridImg, x, rowY, (int) Math.round(drawLaneWidth), (int) Math.round(drawRowHeight), null);
                     } else {
                         g2d.setColor((rowActual % 2 == 0) ? Color.DARK_GRAY : Color.GRAY);
-                        g2d.fillRect(x, rowY, laneWidth, rowHeight);
+                        g2d.fillRect(x, rowY, (int) Math.round(drawLaneWidth), (int) Math.round(drawRowHeight));
                     }
                     g2d.setColor(Color.BLACK);
-                    g2d.drawRect(x, rowY, laneWidth, rowHeight);
+                    g2d.drawRect(x, rowY, (int) Math.round(drawLaneWidth), (int) Math.round(drawRowHeight));
                 }
             }
 
             g2d.setColor(Color.CYAN);
             g2d.setStroke(new BasicStroke(3));
-            g2d.drawLine(gridStartX + (4 * laneWidth), gridStartY, gridStartX + (4 * laneWidth), getHeight());
+            if (keyCount == 8) {
+                int separatorX = (int) Math.round(gridStartX + (4 * drawLaneWidth) - cameraXOffset);
+                g2d.drawLine(separatorX, gridStartY, separatorX, getHeight());
+            }
 
             if (isPlaying) {
                 double playheadRowBase = positionStepsDouble % GRID_STEPS_PER_SECTION;
                 if (playheadRowBase < 0) playheadRowBase += GRID_STEPS_PER_SECTION;
                 double playheadRow = playheadRowBase * (stepsPerSection / (double) GRID_STEPS_PER_SECTION);
-                double playheadY = gridStartY + ((playheadRow - scrollRowOffset) * rowHeight);
+                double playheadY = gridStartY + ((playheadRow - scrollRowOffset) * effectiveRowHeight());
                 if (playheadY >= gridStartY - 2 && playheadY <= getHeight() + 2) {
                     g2d.setColor(Color.YELLOW);
                     g2d.setStroke(new BasicStroke(3));
-                    g2d.drawLine(gridStartX, (int) Math.round(playheadY),
-                                 gridStartX + (8 * laneWidth), (int) Math.round(playheadY));
-                    g2d.fillOval(gridStartX + (8 * laneWidth) - 7, (int) Math.round(playheadY) - 7, 14, 14);
+                    int playheadStartX = (int) Math.round(gridStartX - cameraXOffset);
+                    int playheadEndX = (int) Math.round(gridStartX + (keyCount * drawLaneWidth) - cameraXOffset);
+                    g2d.drawLine(playheadStartX, (int) Math.round(playheadY), playheadEndX, (int) Math.round(playheadY));
+                    g2d.fillOval(playheadEndX - 7, (int) Math.round(playheadY) - 7, 14, 14);
                 }
             }
 
@@ -3886,8 +3205,8 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             Section sec = activeSong.notes.get(currentSectionIndex);
 
             int visibleFirstRow = Math.max(0, (int) Math.floor(scrollRowOffset));
-            int visibleLastRow = Math.min(stepsPerSection - 1, (int) Math.ceil(scrollRowOffset + (getHeight() - gridStartY) / (double) rowHeight));
-            final long maxRenderedPerRow = 2048;
+            int visibleLastRow = Math.min(stepsPerSection - 1, (int) Math.ceil(scrollRowOffset + (getHeight() - gridStartY) / effectiveRowHeight()));
+            final long maxRenderedPerRow = 20000;
 
             // A fully transparent note layer should do no note rendering at all.
             // This both fixes the visual issue and avoids wasting time iterating/rendering
@@ -3895,9 +3214,7 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             if (opacity > 0.0f) {
                 g2d.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, opacity));
 
-                int firstStorageRow = storageRowForDisplayRow(visibleFirstRow);
-                int lastStorageRow = storageRowForDisplayRow(Math.max(visibleFirstRow, visibleLastRow));
-                for (int storageRow = firstStorageRow; storageRow <= lastStorageRow; storageRow++) {
+                for (int storageRow = 0; storageRow < GRID_STEPS_PER_SECTION; storageRow++) {
                     long rowCount = sec.sectionNotes.rowSize(storageRow);
                     if (rowCount == 0) continue;
                     long stride = Math.max(1L, (rowCount + maxRenderedPerRow - 1) / maxRenderedPerRow);
@@ -3912,11 +3229,11 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
 
                         if (rowActualDouble >= -0.1 && rowActualDouble < stepsPerSection
                                 && rowVisualDouble >= -0.1 && rowVisualDouble < stepsPerSection
-                                && userLane >= 0 && userLane <= 7) {
+                                && userLane >= 0 && userLane < keyCount) {
                             renderedNotes++;
                             int laneVisual = mapUserLaneToVisualLane(userLane);
-                            int x = gridStartX + (laneVisual * laneWidth);
-                            int y = gridStartY + (int) Math.round(rowVisualDouble * rowHeight);
+                            int x = (int) Math.round(gridStartX + (laneVisual * drawLaneWidth) - cameraXOffset);
+                            int y = gridStartY + (int) Math.round(rowVisualDouble * drawRowHeight);
 
                             if (sustain > 0) {
                                 // Sustain is measured from the note head, not from the top of the
@@ -3926,16 +3243,20 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
                                 // visible long-note length exactly equal to the stored
                                 // sustain grid length.
                                 double sustainGrids = sustain / displayStepTimeMs();
-                                int tailHeight = Math.max(0, (int) Math.round((sustainGrids - 0.5) * rowHeight));
+                                int tailHeight = Math.max(0, (int) Math.round((sustainGrids - 0.5) * drawRowHeight));
                                 g2d.setColor(new Color(0, 255, 0, 150));
-                                g2d.fillRect(x + (laneWidth / 3), y + (rowHeight / 2), laneWidth / 3, tailHeight);
+                                int bodyWidth = Math.max(1, (int) Math.round(drawLaneWidth / 3.0));
+                                g2d.fillRect(x + bodyWidth, y + ((int) Math.round(drawRowHeight) / 2), bodyWidth, tailHeight);
                             }
 
-                            if (noteArrows[laneVisual] != null) {
-                                g2d.drawImage(noteArrows[laneVisual], x, y, laneWidth, rowHeight, null);
+                            BufferedImage arrow = noteArrows[laneVisual % noteArrows.length];
+                            if (arrow != null) {
+                                g2d.drawImage(arrow, x, y, (int) Math.round(drawLaneWidth), (int) Math.round(drawRowHeight), null);
                             } else {
                                 g2d.setColor(Color.YELLOW);
-                                g2d.fillOval(x + 2, y + 2, laneWidth - 4, rowHeight - 4);
+                                int cellW = Math.max(1, (int) Math.round(drawLaneWidth));
+                                int cellH = Math.max(1, (int) Math.round(drawRowHeight));
+                                g2d.fillOval(x + 2, y + 2, Math.max(1, cellW - 4), Math.max(1, cellH - 4));
                             }
                         }
                     }
@@ -3945,20 +3266,18 @@ JButton spamNotesBtn = new JButton("Spam Notes Across Grids");
             }
 
             if (shortcutsInfo != null) {
-                // Never scan every note during paint. A chart can contain hundreds
-                // of millions or more notes, and the old UI did a full note-by-note
-                // count on every repaint even when notes were fully invisible.
                 long opponentNotes = 0;
                 long playerNotes = 0;
                 for (Section countSection : activeSong.notes) {
-                    opponentNotes += countSection.sectionNotes.countLane(0);
-                    opponentNotes += countSection.sectionNotes.countLane(1);
-                    opponentNotes += countSection.sectionNotes.countLane(2);
-                    opponentNotes += countSection.sectionNotes.countLane(3);
-                    playerNotes += countSection.sectionNotes.countLane(4);
-                    playerNotes += countSection.sectionNotes.countLane(5);
-                    playerNotes += countSection.sectionNotes.countLane(6);
-                    playerNotes += countSection.sectionNotes.countLane(7);
+                    long n = countSection.sectionNotes.size();
+                    for (long i = 0; i < n; i++) {
+                        int lane = countSection.sectionNotes.getLane(i);
+                        if (keyCount == 8) {
+                            if (lane < 4) opponentNotes++; else playerNotes++;
+                        } else {
+                            if (lane < (keyCount / 2)) opponentNotes++; else playerNotes++;
+                        }
+                    }
                 }
                 shortcutsInfo.setText(
                     "SPACE BAR - Start / Pause Playback (BPM Camera Follow)\n" +

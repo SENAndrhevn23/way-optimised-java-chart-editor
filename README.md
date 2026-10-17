@@ -11,6 +11,7 @@ Welcome to the final version of the **Java Chart Editor**! This repository marks
 ## What's Next?
 
 The project is moving forward! A brand new, high-performance **Rust Chart Editor** is coming soon. Stay tuned for a faster, more powerful rewrite built from the ground up.
+Rust Editor is now out, this repo will not be archived, its 100% finished **https://github.com/SENAndrhevn23/Rust-Editor**
 
 ---
 *Thank you for using and supporting the Java version!*
